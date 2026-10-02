@@ -255,3 +255,18 @@ Spring AI Alibaba 的 API 在快速迭代中，`ChatModel.call()` 的参数签�
 - 现有实现被忽略——所有任务按从零构建设计
 - 宪法原则 V（审计 Day One 落库）要求 `llm_calls` 写入贯穿所有 Provider 调用路径，包括 Mock Provider
 - Commit after each task or logical group
+
+---
+
+## Phase 9: Convergence
+
+**Purpose**: 弥合 spec/plan/contract 与当前实现之间的差距（speckit-converge 2026-10-03）
+
+**Checked**: 11 FR, 5 SC, 10 验收场景, 8 宪法原则, 41 tasks — 0 CRITICAL, 0 HIGH, 2 MEDIUM, 4 LOW
+
+- [ ] T042 在 `DefaultProviderService.call()` 入口添加 messages 前置校验：messages 不能为 null/空，且至少包含一条 USER 消息，否则抛 `IllegalArgumentException` per Contract §Error Cases, FR-008 (partial)
+- [ ] T043 将 `ProviderRegistrar.init()` 中 providers 列表为空时的 `log.warn` + `return` 改为抛 `IllegalStateException("No providers configured under oryxos.providers")`，使启动失败而非静默跳过 per Contract §Configuration Validation, FR-008 (contradicts)
+- [ ] T044 [P] 在 `ProviderAbstractionIT` 中补充错误透传测试：配置一个指向不存在域名的 openai provider，调用后断言抛出 `ProviderCallException` 且审计记录 success=false、error_message 非空 per T038, FR-011 (missing)
+- [ ] T045 [P] 将 `KNOWN_TYPES` 中的 `dashscope` 移除（当前 pom 未引入 DashScope 依赖），或在 `spring.autoconfigure.exclude` 中补充 DashScope 自动配置类排除 per T039, FR-009 (missing)
+- [ ] T046 [P] 在 `ProviderAbstractionIT` 中补充日志无 API key 泄露断言：验证 `ProviderProperties.toString()` 输出不含实际 apiKey 值 per T040, FR-006 (missing)
+- [ ] T047 [P] 在 tasks.md Notes 中记录 quickstart.md 场景 3（真实 Provider 端到端）为手动验证项，需 API key；其余 5 个场景已由 ProviderAbstractionIT 覆盖 per T041 (missing)
