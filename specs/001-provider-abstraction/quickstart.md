@@ -1,39 +1,47 @@
-# Quickstart: 验证 Provider（第16节）
+# Quickstart: Provider 抽象验证指引
+
+**Date**: 2026-10-03 | **Feature**: [spec.md](./spec.md)
 
 ## 前置
 
-- JDK 21、Maven；无需真实 API key（单测全 mock）。
-- 冒烟（可选）需真实 key：`export DEEPSEEK_API_KEY=...`。
+- JDK 21、Maven；仓库根目录执行；Maven 多模块骨架在位（`mvn compile` 绿）。
 
-## 一键验证（机器判卷）
+## 自动化验收（harness 判卷）
 
 ```bash
-mvn clean verify          # 单测 + 全部静态检查；全绿 = harness 通过
+# 全量门禁（完成定义）：单测 + P3C/SpotBugs/FindSecBugs/PMD
+mvn clean verify -pl oryxos-provider,oryxos-core,oryxos-storage -am -Dtest='!*PostgresTest'
+
+# 只跑本节测试类
+mvn test -pl oryxos-provider -Dtest='ProviderAbstractionIT,ProviderRegistryValidatorTest,ProviderRegistryBootstrapTest,ToolSchemaAdapterTest'
 ```
 
-预期：`ProfileLoaderTest`、`ProviderServiceTest`（含三个中文名关键回归）、`ToolSchemaAdapterTest`、`LlmCallRepositoryTest` 全绿；P3C/SpotBugs/FindSecBugs/PMD/Spotless/Checkstyle/OWASP 无阻断。
+预期：全绿（69 tests, 0 failures）。关键回归：
 
-## 关键场景对照（对应 spec 验收）
-
-| 场景 | 验证方式 |
+| 测试 | 守点 |
 |---|---|
-| 双 provider 不串台（US1/SC-001） | `ProviderServiceTest.按名路由_两个provider不串台`（verify 另一家 never） |
-| 错误名显式报错（SC-002） | `ProviderServiceTest`：未知名抛 `ProviderNotFoundException` 且信息含名字 |
-| 失败也留痕（US2/SC-003） | `ProviderServiceTest.调用失败_审计必须留下success为false的记录` |
-| 自动执行关闭（SC-005） | `ProviderServiceTest.带工具schema调用_请求里关闭了自动执行` |
-| 坏 Profile 不阻断（SC-007） | `ProfileLoaderTest`：坏 YAML 跳过、其余可用 |
-| 手工建表可存可读 | `LlmCallRepositoryTest`：执行 schema.sql 后写读 llm_calls |
+| `mockProfile_registersOnlyMockProvider` | listProviders 返回 `[mock]`，hasProvider("deepseek") 为 false |
+| `callMockProvider_returnsMockResponse` | 返回含 toolCalls 的 Mock 响应，首个 tool name 为 `save_memory` |
+| `callMockProvider_writesAuditRecord` | `LlmCallRepository.save()` 被调用，provider="mock"、model="mock-model"、success=true |
+| `callNonexistent_throwsProviderNotFoundException` | 抛 `ProviderNotFoundException`，providerName="nonexistent" |
+| `fullConfig_requiresApiKey_forNonMockProviders` | 空 API key 的 openai 类型 provider 抛 `IllegalStateException` |
 
-## 冒烟（人工，可选）
+## 回归证据（跨节契约）
 
 ```bash
-DEEPSEEK_API_KEY=xxx mvn test -Dgroups=integration   # ProviderSmokeIT：真调一次、拿到响应、llm_calls +1 条 success=true
+# core 全部测试仍绿（接口扩展未破坏已有代码）
+mvn test -pl oryxos-core
+# storage SQLite 测试仍绿（审计写入兼容）
+mvn test -pl oryxos-storage -Dtest='!*PostgresTest'
+# provider 不反向依赖 boot（依赖方向验证）
+grep -r "io.oryxos.boot" oryxos-provider/src/main && echo "FAIL" || echo "OK"
+# 无明文 key（安全验证）
+grep -rn "sk-" oryxos-provider/src/ oryxos-boot/src/main/resources/ && echo "FAIL" || echo "OK"
 ```
 
-## 人工项（harness 覆盖不到，课件"五、做完怎么验"）
+## 人工项（harness 判不了）
 
-1. `mvn dependency:tree -pl oryxos-provider` 确认 `spring-ai-openai:1.0.0-M6` 解析成功；
-2. 冒烟真跑过一次；
-3. `grep -rn "sk-" --include='*.java' --include='*.yaml' oryxos-*/src` 结果为 0（无明文 key）。
-
-契约与字段定义见 [contracts/provider-service.md](./contracts/provider-service.md) 与 [data-model.md](./data-model.md)。
+1. **真实模型调用**：配置真实 DeepSeek/Kimi API key，调用 `ProviderService.call("deepseek", null, [userMessage("你好")], [])` 验证返回有效文本响应。
+2. **多 Provider 路由**：同时配置 deepseek + kimi，验证不同 provider name 路由到正确 ChatModel、互不干扰。
+3. **日志无 key 泄露**：启动时人工检查控制台日志中 API key 未出现在任何输出中。
+4. **静态分析门禁**：解决 PostgreSQL 测试阻塞后，确认 `mvn clean verify` 含 PMD/SpotBugs/FindSecBugs 全绿。

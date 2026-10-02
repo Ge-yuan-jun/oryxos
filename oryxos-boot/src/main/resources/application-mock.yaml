@@ -1,0 +1,5 @@
+oryxos:
+  providers:
+    - name: mock
+      type: mock
+      model: mock-model

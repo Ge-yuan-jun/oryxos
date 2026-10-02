@@ -1,53 +1,93 @@
-# Research: Provider（第16节）
+# Research: Provider 抽象——对接大模型的统一入口
 
-Phase 0 决策记录。每条：Decision / Rationale / Alternatives considered。带 ⚠ 的项列入 implement 写前核实清单（H3）。
+**Feature**: 001-provider-abstraction | **Date**: 2026-10-02
 
-## D1. deepseek / kimi 的接入路径：`spring-ai-openai`（库模块，非 starter）
+## 1. Spring AI Alibaba 多 Provider 显式映射最佳实践
 
-- **Decision**: 两家均为 OpenAI 兼容端点，用 M6 BOM 中的 `spring-ai-openai` 构件，手工 `new OpenAiApi(baseUrl, apiKey)` + `new OpenAiChatModel(...)` 逐 provider 构造实例；不引入 `spring-ai-openai-spring-boot-starter`（starter 自动装配只会产出单实例且违背宪法 II 的禁 eager 装配）。
-- **Rationale**: 已从本地 `spring-ai-bom-1.0.0-M6.pom` 查证 BOM 含 `spring-ai-openai`；多 provider 需要同类型多实例，手工构造是显式映射（宪法 III）的自然实现。
-- **Alternatives considered**: `spring-ai-deepseek`——M6 BOM 不含（前期已验证），弃；每家单独 starter——BOM 覆盖不全且自动装配与宪法 II 冲突，弃。
-- ✅ 已核实（T003，javap M6 jar）：`new OpenAiApi(String baseUrl, String apiKey)`；`new OpenAiChatModel(OpenAiApi)` / `(OpenAiApi, OpenAiChatOptions)`。
+**Decision**: 不使用 Spring AI 的自动 `ChatModel` Bean 注册，自行通过 `@ConfigurationProperties` 读取 `oryxos.providers` 配置列表，手动创建每个 `ChatModel` 实例并放入 `Map<String, ChatModel>`。
 
-## D2. 关闭自动工具执行的机制（宪法 II 核心）
+**Rationale**:
+- Spring AI Alibaba 的默认自动配置为每种 connector 类型创建一个 `ChatModel` Bean（如 `OpenAiChatModel`）。当同时配置两个 OpenAI-compatible Provider（如 DeepSeek 和 Kimi，都走 OpenAI 协议）时，会出现同类型多 Bean 冲突。
+- 自行创建 `ChatModel` 实例可以完全控制映射关系，每个实例绑定唯一的 provider name。
+- 配置驱动：`application.yaml` 中 `oryxos.providers` 列表声明每个 Provider 的 name、type（`openai` / `dashscope`）、model、api-key 占位符、base-url。`ProviderRegistrar` 启动时遍历配置、按 type 选择对应的 `ChatModel` 构造器、建立映射。
 
-- **Decision**: M6 中把工具 schema 挂到请求但不让框架代执行的机制是 chat options 的 **`proxyToolCalls=true`**（代理工具调用：模型返回 tool call 时原样交回调用方）。以此为第一候选实现"只翻译不执行"。
-- **Rationale**: M6 文档语义与本节 FR-004 完全对应；调用方式保持 `chatModel.call(new Prompt(messages, options))`。
-- **Alternatives considered**: 不传工具 schema（无法满足 FR-004，弃）；用 ChatClient 的 tools API（宪法 I/II 禁，弃）。
-- ✅ 已核实（T003，javap M6 jar）：`OpenAiChatOptions.builder().proxyToolCalls(true)` 存在；工具挂载 `toolCallbacks(List<FunctionCallback>)`；`FunctionCallback`（spring-ai-core M6）是接口，含 `getName/getDescription/getInputTypeSchema/call`——适配器直接实现该接口，`call` 抛 `IllegalStateException`（proxy 模式下框架不会调它，抛出即为"绝不执行"的第二道保险）。harness 的 `带工具schema调用_请求里关闭了自动执行` 为此项回归钉。
+**Alternatives Considered**:
+- `@Qualifier` + 手工 Bean 声明：每加一个 Provider 就要改 Java 配置类，不符合"配置驱动"。
+- `BeanFactoryPostProcessor` 动态注册：增加 Spring 容器耦合，调试困难。
 
-## D3. 禁用 Spring AI Alibaba 的 eager 自动装配
+## 2. 禁用 Spring AI 自动装配（eager auto-config）
 
-- **Decision**: 保留 `spring-ai-alibaba-starter` 依赖（qwen 备用），但在启动配置排除 `DashScopeAutoConfiguration`（既有做法，见 CLAUDE.md 记忆：无 key 时 eager 装配会阻断启动）；本节测试不依赖任何自动装配。
-- **Rationale**: 宪法 II 明文要求；本节单测全部 mock ChatModel，不受影响。
+**Decision**: 在 `application.yaml` 中显式排除所有 Spring AI Alibaba 的自动配置类（如 `DashScopeAutoConfiguration`、`OpenAiAutoConfiguration`），由 `oryxos-provider` 的 `ProviderAutoConfiguration` 接管 ChatModel 创建。
 
-## D4. `OryxTool` 补 `getInputSchema()`
+**Rationale**:
+- Spring AI 的自动装配会在启动时尝试初始化所有声明了依赖的 connector，如果某个 Provider 没有配 API key 会阻断启动（FR-009）。
+- 显式排除后，只有 `oryxos.providers` 中实际配置的 Provider 才会被实例化。
+- Mock Provider 不走 Spring AI connector，由 `MockChatModel`（实现 `ChatModel` 接口）直接返回固定响应。
 
-- **Decision**: 给既有 stub 增加 `String getInputSchema()`（返回 JSON Schema 文本）。
-- **Rationale**: TechnicalSolution §6.1 权威定义 OryxTool 四方法含 getInputSchema；20 节课件"动手前先检查"明确预告此坑（"这个方法不补上，Provider 翻译 Function Calling 时没地方拿参数说明"）。**软门禁标注**：OryxTool 在 16 节交付物清单之外，此改动在 tasks 停点请用户确认。
-- **Alternatives considered**: 返回自定义 `JsonSchema` 类型（课件示意代码的写法）——需新增一个公共类型，违背 H5 不过度设计，且 TechSol 未定 Java 类型；返回 Jackson `JsonNode`——序列化边界更模糊。选 String 最中立。
+**Alternatives Considered**:
+- `@ConditionalOnProperty` 逐个控制：Spring AI 内部的 auto-config 类不一定都提供 property 开关，不够可靠。
+- `spring.autoconfigure.exclude` 全局排除：这正是我们选择的方式，可靠且显式。
 
-## D5. 审计写入自身失败的处理
+## 3. Function Calling 适配策略
 
-- **Decision**: `LlmCallAuditor` 实现内部 catch，记 ERROR 日志、不阻断模型调用主链路。
-- **Rationale**: 可用性优先；核心阶段 SQLite 本地文件库失败概率极低。已记入 spec Assumptions（clarify 记录）。
+**Decision**: `FunctionCallingAdapter` 将 `OryxTool` 列表转换为 Spring AI 的 `FunctionCallback` 列表，在调 `ChatModel.call(Prompt)` 时通过 `ChatOptions` 传入。LLM 返回的 `tool_call` 由调用方（未来的 ReAct 循环）解析执行，`ProviderService` 只负责传递。
 
-## D6. temperature 缺省行为
+**Rationale**:
+- Spring AI 提供 `FunctionCallback` / `FunctionCallbackWrapper` 机制生成 JSON Schema 并序列化到 LLM 请求中（FR-004）。
+- 必须禁用 Spring AI 的自动 tool 执行（FR-005，宪法原则 II）：不使用 `ChatClient` 的 fluent API（它会自动执行 tool），而是直接用 `ChatModel.call(new Prompt(messages, options))`。
+- `ProviderService.call()` 返回的 `LlmResponse` 包含 `List<ToolCall>`（tool name + arguments JSON），由上层决定是否执行。
 
-- **Decision**: Profile 未声明 temperature 时不设置该参数，使用 provider 侧默认。已记入 spec Assumptions。
+**Alternatives Considered**:
+- 自己拼 JSON Schema：Spring AI 已经做好了这件事，重复实现违反技术方案决策二。
+- 用 `ChatClient` 但关闭 auto-execute：`ChatClient` 的 API 设计倾向自动执行，关闭路径不稳定，直接用 `ChatModel` 更安全。
 
-## D7. Repository 测试的建表方式
+## 4. 审计表 `llm_calls` 写入时机
 
-- **Decision**: `LlmCallRepositoryTest` 用 `@DataJpaTest` + 显式执行 `schema.sql` + SQLite 文件库（临时目录），`hibernate.ddl-auto=none`。
-- **Rationale**: 课件 harness 明确要求"建表要走那份手工脚本，不要让 Hibernate 自动建"；`sqlite-jdbc` 与 `hibernate-community-dialects` 已在 storage pom，无新增依赖。
-- **Alternatives considered**: H2 内存库——方言差异导致"测试绿、生产列名不对"，正是课件点名要避免的，弃。
+**Decision**: 在 `DefaultProviderService.call()` 内部，LLM 调用返回后立即通过 `LlmCallAuditor` 写入 `llm_calls` 表。写入与业务调用在同一虚拟线程内同步完成。
 
-## D8. Prompt 载体类型
+**Rationale**:
+- 宪法原则 V（NON-NEGOTIABLE）：审计写入不可省，Day One 就落库。
+- 同步写入简单可靠（宪法原则 VII），虚拟线程下 SQLite 写入延迟可忽略。
+- 记录字段：id、provider_name、model、input_tokens、output_tokens、total_tokens、duration_ms、timestamp、success（boolean）、error_message（nullable）。
 
-- **Decision**: 本节定义轻量载体 `ProviderRequest`（在 oryxos-provider 内）：消息文本 + 可用工具列表（`List<OryxTool>`），`chat` 内部翻译成 Spring AI `Prompt`。课件签名 `chat(sessionId, Profile, Prompt)` 中的 "Prompt" 语义为"要发给模型的内容"，17 节 PromptBuilder 才是其真正生产者。
-- **Rationale**: 直接用 Spring AI 的 `Prompt` 作为公共签名会把框架类型泄漏给 oryxos-core 的下游（17 节 ReActLoop），违背"只借管道不交控制权"。**软门禁标注**：`ProviderRequest` 是交付物清单外的公共类型，tasks 停点请用户确认（备选：签名直接收 `String userContent + List<OryxTool>` 两参，零新增类型但可扩展性差）。
+**Alternatives Considered**:
+- 异步事件写入（`ApplicationEvent`）：引入异步违反原则 VII，且增加丢失风险。
+- 只写日志：违反原则 V，日志反解析代价高。
 
-## 依赖变更清单（H3 条款 6：plan 列明）
+## 5. Mock Provider 实现策略
 
-- oryxos-provider pom：**新增** `org.springframework.ai:spring-ai-openai`（版本由已锁定 BOM 管理）。
-- 其余零新增：SnakeYAML（spring-boot-starter 传递）、JPA/sqlite-jdbc/方言（storage pom 已有）、Mockito/JUnit（spring-boot-starter-test）。
+**Decision**: `MockChatModel` 实现 Spring AI 的 `ChatModel` 接口，固定返回可配置的文本响应，并支持模拟 Function Calling（返回 `tool_call` 响应）。通过 `application-mock.yaml` 激活，provider name 为 `mock`。
+
+**Rationale**:
+- FR-010 要求内置 Mock Provider 以支持无 API key 的全链路验证和 CI 测试。
+- 实现 `ChatModel` 接口而非在 `ProviderService` 层 mock，这样 Mock Provider 的行为路径与真实 Provider 完全一致（包括 Function Calling 适配、审计写入）。
+- Mock 模式的 Function Calling 模拟：配置指定当特定 tool name 出现在可用工具中时，返回对应的 `tool_call` 响应，参数为预设 JSON。
+
+**Alternatives Considered**:
+- 测试中用 Mockito mock `ChatModel`：无法支持集成测试和开发者手动跑通全链路。
+- Mock Server（WireMock）：增加外部依赖，CI 复杂度高。
+
+## 6. API Key 安全加载与校验
+
+**Decision**: `application.yaml` 中 API key 统一使用 `${ENV_VAR:}` 占位符。`ProviderRegistrar` 在构建映射表时校验每个配置了的 Provider 的 API key 非空非空白字符串；校验失败时抛出 `IllegalStateException` 并给出明确错误信息（指出缺失的配置项和对应环境变量名）。Mock Provider 不需要 API key。
+
+**Rationale**:
+- FR-006、FR-008、宪法原则 VI 共同要求：key 不明文、配置缺失清晰报错。
+- Spring Boot 原生支持 `${ENV_VAR}` 解析，无需额外实现。
+- 日志中 API key 的脱敏：`ProviderProperties` 的 `toString()` 方法 MUST NOT 输出 apiKey 字段；Logback 配置中不记录请求 headers。
+
+**Alternatives Considered**:
+- 启动后首次调用时才校验：延迟暴露问题，不如 fail-fast。
+- 加密存储 key：核心阶段过度设计，环境变量已满足安全需求。
+
+## 7. 错误透传策略
+
+**Decision**: `ProviderService.call()` 在 LLM 调用失败时（网络超时、HTTP 5xx、响应解析异常）直接抛出包装后的 `ProviderCallException`（包含 provider name、model、原始错误信息），不做重试。审计表中 `success=false` + `error_message` 记录失败详情。
+
+**Rationale**:
+- FR-011 + spec clarification：Provider 层不重试，错误透传给调用方（未来的 ReAct 循环），重试策略留给扩展阶段。
+- 包装为统一异常类型，上层不需要区分是 `HttpTimeoutException` 还是 `RestClientException`。
+
+**Alternatives Considered**:
+- 返回 `Optional` 或 `Result` 类型：增加调用方复杂度，且"错误"不应被静默吞掉。
+- 按错误类型分类重试：clarification 明确不做，留给扩展阶段。
