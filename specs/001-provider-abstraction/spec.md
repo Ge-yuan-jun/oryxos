@@ -1,105 +1,138 @@
-# Feature Specification: Provider——对接大模型的统一入口（第16节）
+# Feature Specification: Provider 抽象——对接大模型的统一入口
 
-**Feature Branch**: `class-16`
+**Feature Branch**: `dev/first-task`
 
-**Created**: 2026-07-09
+**Created**: 2026-10-02
 
 **Status**: Draft
 
-**Input**: User description: "第16节需求：Provider——对接大模型的统一入口。多家模型并存、模型可随时换、每次调用可审计；Profile 声明模型选择；实例级 provider 清单与凭证；按名路由调用；只翻译工具不执行；成败都落审计；凭证走环境变量。边界：不做 ReAct/工具执行/fallback/成本看板/流式。"
+**Input**: US-1 — Provider 抽象（对接 LLM）。让 OryxOS 能调用任意主流 LLM，Agent 不感知具体调的是哪家模型。LLM 调用复杂度由 Spring AI Alibaba 吸收，OryxOS 只做一层薄包装。
 
-## User Scenarios & Testing *(mandatory)*
+**Source**:
+- 需求文档 `docs/DemandAnalysis.md` §5.3（核心能力一：对接 LLM）
+- 技术方案 `docs/TechnicalSolution.md` §3（Provider 抽象）
+- AI 编程指南 `docs/AiProgrammingGuide.md` US-1
 
-### User Story 1 - 多 Provider 并存，按 Agent 配置精确路由 (Priority: P1)
+## Clarifications
 
-企业在同一个 OryxOS 实例上跑多个 Agent：运维 Agent 用 deepseek、客服 Agent 用 qwen。每个 Agent 的一次模型调用，必须严格路由到它自己 Profile 里声明的那家 provider 和那个 model，拿回响应原样返回给上层；请求里可以附带"有哪些工具可用"的说明，模型若回复"想调某工具"，该请求原样交回上层，本能力绝不代为执行。
+### Session 2026-10-02
 
-**Why this priority**: 这是 Provider 存在的意义本身——没有精确路由，多 Agent 并存就是空话；没有"只翻译不执行"，工具会被重复执行且绕过安全检查。这一条通了才有 MVP。
+- Q: 系统是否应该内置一个 Mock Provider，让开发者在没有任何真实 LLM API key 的情况下也能跑通全链路？ → A: 内置 Mock Provider，返回固定文本响应，支持 Function Calling 模拟
+- Q: 当 LLM Provider API 调用失败（网络超时、5xx 错误）时，ProviderService 应该采用什么重试策略？ → A: 不重试，直接将错误信息透传给调用方（ReAct 循环），重试策略留给扩展阶段
 
-**Independent Test**: 配置两家 provider，各发一次调用，验证各自命中目标家、另一家零调用；附带工具说明发一次调用，验证模型的工具调用请求被原样透传、本能力零执行。
+## User Scenarios & Testing
+
+### User Story 1 - 单 Provider 对话调用 (Priority: P1)
+
+企业开发者在 `application.yaml` 中配置一个 LLM Provider（如 DeepSeek），启动 OryxOS 后，通过 ReAct 循环向该 Provider 发送对话请求，获得正确的 LLM 响应。开发者无需关心底层是哪家 LLM 的 API 协议。
+
+**Why this priority**: 这是整个 Agent OS 的最基础能力——没有 LLM 调用，所有后续能力（ReAct、Memory、Tool）都无法运行。单 Provider 调通是最短验证路径。
+
+**Independent Test**: 配置一个 DeepSeek Provider，调用 `ProviderService.call(profile, prompt)` 传入简单 prompt，验证返回有效的 LLM 文本响应。
 
 **Acceptance Scenarios**:
 
-1. **Given** 实例配置了 deepseek 和 kimi 两家 provider，**When** 使用声明 kimi 的 Profile 发起一次调用，**Then** 请求发往 kimi，deepseek 全程零调用，响应原样返回。
-2. **Given** Profile 声明的 provider 名在实例清单中不存在，**When** 发起调用，**Then** 立即得到明确报错（指出是哪个名字找不到），绝不静默改用其他家。
-3. **Given** 调用附带了可用工具的说明，**When** 模型返回"想调用某工具"的请求，**Then** 该请求原样出现在返回结果中，本能力未执行任何工具。
+1. **Given** `application.yaml` 配置了 DeepSeek 的 api-key 和 base-url, **When** 调用 `ProviderService` 发送 "你好", **Then** 返回 DeepSeek 的有效文本响应
+2. **Given** `application.yaml` 配置了 DeepSeek Provider, **When** OryxOS 启动, **Then** `ProviderService` 的 provider 映射表中包含 `deepseek` 条目
+3. **Given** 一个 Profile 指定 `provider: deepseek`, **When** ReAct 循环通过该 Profile 调 LLM, **Then** 请求路由到 DeepSeek 的 ChatModel 而非其他 Provider
 
 ---
 
-### User Story 2 - 每次调用可审计，成败都留痕 (Priority: P2)
+### User Story 2 - 多 Provider 并存与切换 (Priority: P2)
 
-审计员事后要能查到：某次会话调了哪家 provider、哪个 model、输入输出各多少 token、耗时多久；一次失败的调用（超时、限流、模型报错）同样要留下记录，包含失败标识和人能读懂的失败原因，并按会话关联。
+企业开发者同时配置多个 LLM Provider（如 DeepSeek 和 Kimi），不同 Agent Profile 引用不同 Provider，运行时根据 Profile 配置路由到正确的 LLM，互不干扰。
 
-**Why this priority**: 可审计是产品的核心差异化卖点，且审计数据必须从第一天写入——事后从日志反解析等于返工。它依赖 P1 的调用链路存在，故为 P2。
+**Why this priority**: 多 Provider 并存是企业场景的刚需（不同任务用不同模型），但优先级低于单 Provider 调通。
 
-**Independent Test**: 发起一次成功调用和一次注定失败的调用（如无效凭证），分别验证审计记录存在、字段完整、成败标识正确。
+**Independent Test**: 配置 DeepSeek 和 Kimi 两个 Provider，创建两个 Profile 分别引用，验证调用时路由到各自正确的 ChatModel。
 
 **Acceptance Scenarios**:
 
-1. **Given** 一次成功的模型调用，**When** 调用完成，**Then** 留下恰好一条审计记录：provider、model、token 用量、耗时、成功标识、所属会话。
-2. **Given** 一次失败的模型调用（如网络超时），**When** 异常发生，**Then** 审计记录先落（失败标识 + 失败原因），异常再继续抛给上层——记录与报错二者都不缺。
+1. **Given** `application.yaml` 配置了 deepseek 和 kimi 两个 Provider, **When** OryxOS 启动, **Then** `ProviderService` 映射表中同时包含 `deepseek` 和 `kimi` 两个条目
+2. **Given** Profile A 指定 `provider: deepseek`、Profile B 指定 `provider: kimi`, **When** 分别通过两个 Profile 调 LLM, **Then** 请求各自路由到正确的 ChatModel
+3. **Given** 配置了多个 Provider, **When** 某个 Profile 引用了不存在的 provider name, **Then** 启动时报告明确错误而非静默失败
 
 ---
 
-### User Story 3 - 配置即运维：换模型零代码，坏配置不拖垮系统 (Priority: P3)
+### User Story 3 - Function Calling 格式适配 (Priority: P2)
 
-管理员给某个 Agent 换模型，只改该 Agent Profile 里的 provider/model 字段；系统启动时加载全部 Agent 配置文件，个别文件损坏只记错误、不阻断其余 Agent 正常可用；所有凭证从环境变量注入，任何代码、配置文件、日志里都不出现明文。
+OryxOS 内部的 `OryxTool` 抽象能被正确转换为 LLM 能理解的 Function Calling 格式，且转换过程完全利用 Spring AI 已有能力，不重复实现各家 LLM 的协议差异。
 
-**Why this priority**: 这是长期运维体验和安全底线，建立在 P1/P2 的机制之上。
+**Why this priority**: Function Calling 是 ReAct 循环调工具的前提，但其格式转换依赖 Spring AI 已有能力，实现成本低。
 
-**Independent Test**: 修改 Profile 的 model 字段后重启，验证调用命中新模型；放置一个坏配置文件，验证其余 Agent 不受影响；全文检索验证无明文凭证。
+**Independent Test**: 注册一个 OryxTool，验证 Spring AI 能正确生成其 JSON Schema 并在 LLM 调用时携带 tools 参数。
 
 **Acceptance Scenarios**:
 
-1. **Given** Agent 的 Profile 把 model 从 A 改为 B，**When** 重新加载后发起调用，**Then** 请求使用 model B，全程无代码改动。
-2. **Given** 配置目录里有一个格式损坏的 Profile 文件，**When** 系统启动，**Then** 该文件的错误被记录，其余 Profile 全部正常加载可用。
-3. **Given** 系统运行中，**When** 在代码与配置全文中检索凭证特征，**Then** 检索结果为零（凭证仅存在于环境变量）。
+1. **Given** 注册了一个带参数的 OryxTool, **When** 组装 LLM 调用请求, **Then** 请求中包含该 Tool 的正确 JSON Schema（name、description、parameters）
+2. **Given** LLM 返回了 tool_call 响应, **When** 解析响应, **Then** 能正确提取 tool name 和 arguments，交由 ReAct 循环处理（不触发 Spring AI 的自动执行）
+
+---
+
+### User Story 4 - API Key 安全加载 (Priority: P3)
+
+API key 通过环境变量或配置文件加载，不会出现在代码、日志或提交历史中。配置缺失时给出明确的启动失败提示。
+
+**Why this priority**: 安全是地基（宪法原则 VI），但属于配置层面，不影响核心调用链路验证。
+
+**Independent Test**: 通过环境变量设置 API key，启动 OryxOS 验证 Provider 正常工作；故意不配 API key 验证启动报错信息。
+
+**Acceptance Scenarios**:
+
+1. **Given** API key 通过环境变量设置, **When** OryxOS 启动, **Then** Provider 正常初始化且 key 不出现在日志中
+2. **Given** 未配置某 Provider 的 API key, **When** OryxOS 启动, **Then** 报告明确的错误信息指出缺失的配置项
+3. **Given** `application.yaml` 中 API key 使用 `${ENV_VAR}` 占位符, **When** 对应环境变量存在, **Then** 正确解析并初始化 Provider
 
 ---
 
 ### Edge Cases
 
-- Profile 引用的 provider 名在实例清单中不存在 → 显式报错，指明名字，不静默降级。
-- Profile 文件 YAML 语法损坏 → 记错误日志、跳过该文件，不阻断启动，其余 Profile 正常。
-- 凭证对应的环境变量未设置 → 启动/调用时给出清晰报错，而不是带着空凭证调用后报一个难解的错误。
-- 模型调用中途失败（超时、限流、5xx）→ 审计记录先落（失败标识 + 原因），异常继续上抛，本能力不重试不换家。
-- 模型响应中包含工具调用请求 → 原样透传，本能力零执行。
+- 当 LLM Provider 的 API 返回网络超时或 5xx 错误时，调用方收到明确的错误信息而非未处理异常
+- 当配置文件中出现重复的 provider name 时，启动时报告冲突而非静默覆盖
+- 当 API key 格式无效（如空字符串）时，在首次调用前给出校验失败提示
+- 当 Spring AI Alibaba 的自动装配被禁用后，不存在 API key 的 Provider 不会阻断 OryxOS 启动
+- 使用 Mock Provider 时，系统返回固定文本响应并能模拟 Function Calling 返回 tool_call，以支持全链路验证
 
-## Requirements *(mandatory)*
+## Requirements
 
 ### Functional Requirements
 
-- **FR-001**: 每个 Agent 的模型选择必须由其 Profile（YAML 配置）声明——用哪家 provider、哪个 model、什么温度；系统启动时从约定目录加载全部 Profile，单个坏文件记错误但不阻断启动。
-- **FR-002**: 实例级必须声明可用 provider 清单及各家凭证来源（环境变量占位）；Profile 引用清单中不存在的 provider 名时，必须显式报错，禁止静默跳过或默认替换。
-- **FR-003**: 上层传入会话标识、Profile、提示内容，系统必须按 Profile 选中对应模型、发起一次调用、把结果原样返回；多家并存时路由必须精确、零串台。
-- **FR-004**: 调用请求必须支持附带可用工具的说明（schema）；模型返回工具调用请求时必须原样交回上层——本能力只做格式翻译，绝不执行工具，必须关闭底层框架自带的自动工具执行机制。
-- **FR-005**: 每次调用不论成败必须留下恰好一条审计记录：provider、model、token 用量、耗时、成功标识、失败原因（失败时），按会话关联；失败路径必须先落记录再抛出异常。
-- **FR-006**: 凭证必须只从环境变量读取；代码、配置文件、日志中不得出现明文凭证。
+- **FR-001**: 系统 MUST 提供统一的 `ProviderService` 抽象，对调用方屏蔽不同 LLM 厂商的 API 差异
+- **FR-002**: 系统 MUST 维护显式的 provider name → ChatModel 映射表，MUST NOT 依赖扫描 Spring 容器中的 ChatModel Bean 类型来区分 Provider
+- **FR-003**: 系统 MUST 支持通过 `application.yaml` 配置多个 Provider 实例，每个实例包含 provider name、模型名、API key、可选 base URL
+- **FR-004**: 系统 MUST 将 OryxOS 的 `OryxTool` 抽象转换为 Spring AI 的 Function Calling 格式，仅使用 Spring AI 的 JSON Schema 生成能力
+- **FR-005**: 系统 MUST 禁用 Spring AI 的自动 tool 执行，tool call 的解析和执行由 OryxOS 自行控制
+- **FR-006**: 系统 MUST 支持通过环境变量加载 API key，MUST NOT 将 API key 明文写入日志或提交历史
+- **FR-007**: 系统 MUST 在每次 LLM 调用时记录 token 使用量、Provider name、模型名到审计表 `llm_calls`
+- **FR-008**: 系统 MUST 在配置缺失或无效时给出明确的错误信息，而非静默失败或抛出未处理异常
+- **FR-009**: 系统 MUST 禁用 Spring AI Alibaba 的 eager 模型自动装配（如 `DashScopeAutoConfiguration`），避免无 API key 的 Provider 阻断启动
+- **FR-010**: 系统 MUST 内置一个 Mock Provider，返回固定文本响应并支持 Function Calling 模拟，使开发者在无真实 API key 时也能跑通全链路和 CI 测试
+- **FR-011**: Provider 调用失败时（网络超时、5xx 错误），系统 MUST 将错误信息直接透传给调用方，MUST NOT 在 Provider 层内置重试逻辑，重试策略留给扩展阶段
 
 ### Key Entities
 
-- **Profile**: 一个 Agent 的完整配置载体，本节消费其"模型选择"部分（provider 名、model、温度），同时承载后续各节将使用的全部字段（工具、技能、通知渠道、定时等），本节一并建全。
-- **Provider 清单（实例级配置）**: 声明本实例接入了哪些 provider、各家凭证来自哪个环境变量；是 Profile 中 provider 名的合法性依据。
-- **LLM 调用审计记录（llm_calls）**: 一次模型调用的完整留痕——所属会话、provider、model、token 用量、耗时、成功标识、失败原因。
+- **Provider**: 一个 LLM API 服务的抽象表示，包含 provider name（唯一标识）、模型名、API endpoint、认证信息
+- **Profile**: Agent 的运行时配置，引用一个 Provider name 来决定 LLM 调用路由
+- **ProviderService**: 统一管理所有 Provider 的门面，接收 Profile 和 Prompt 完成 LLM 调用
+- **OryxTool**: 工具的内部抽象，需要被适配为 LLM 能理解的 Function Calling 格式
+- **LLM Call Record**: 每次 LLM 调用的审计记录，包含 token 用量、Provider、模型、时间戳
+- **Mock Provider**: 内置的测试用 Provider，无需 API key，返回固定文本并支持模拟 Function Calling
 
-## Success Criteria *(mandatory)*
+## Success Criteria
 
 ### Measurable Outcomes
 
-- **SC-001**: 两家 provider 并存时，100% 的调用命中 Profile 声明的那家，另一家零调用（串台率为 0）。
-- **SC-002**: 引用不存在 provider 名的调用，100% 得到指明名字的明确报错，静默降级发生率为 0。
-- **SC-003**: 任意一次调用（成功或失败）之后，审计记录恰好新增一条且字段完整；失败调用的记录包含可读的失败原因。
-- **SC-004**: 给一个 Agent 更换模型只需修改配置文件，代码改动为 0 行。
-- **SC-005**: 附带工具说明的调用中，本能力执行工具的次数为 0（工具调用请求 100% 原样透传）。
-- **SC-006**: 在代码与配置全文中可检索到的明文凭证数量为 0。
-- **SC-007**: 存在一个坏 Profile 文件时，其余 Profile 的可用率为 100%（启动不被阻断）。
+- **SC-001**: 开发者配置一个 Provider 后，首次 LLM 调用在 5 秒内返回有效响应（排除网络延迟）
+- **SC-002**: 系统支持同时配置至少 3 个不同的 LLM Provider，各 Provider 间路由零错误
+- **SC-003**: 切换 Agent 使用的 Provider 只需修改 Profile 中的 provider name，无需改动任何代码
+- **SC-004**: 每次 LLM 调用的 token 用量和 Provider 信息 100% 写入审计记录
+- **SC-005**: API key 在任何日志输出和错误信息中均不可见
 
 ## Assumptions
 
-- 目标 provider 的接入依赖在项目锁定的依赖版本清单中可用；课件中的 provider 名（deepseek/kimi/qwen）仅为示意，实际接入哪几家以依赖验证结果为准。
-- 本能力的直接下游消费者是第 17 节的 ReAct 循环；本节交付后暂以测试作为唯一调用方。
-- 核心阶段单实例、内网部署；并发与多实例路由一致性不在本节范围。
-- 审计记录本节只做写入，查询接口与报表属于扩展阶段。
-- 验收的自动化部分由课件《第16节》"验收 harness"测试套件承载；人工项（依赖验证、真实冒烟、明文凭证检索）见课件"五、做完怎么验"。
-- （clarify 记录，合理默认）Profile 未声明 temperature 时不传该参数、使用 provider 侧默认值。
-- （clarify 记录，合理默认）审计记录写入自身失败时：记 ERROR 日志、不阻断本次模型调用——可用性优先于审计完整性；核心阶段审计落本地文件库，失败概率极低。
+- 企业已具备至少一个 LLM Provider 的 API key（如 DeepSeek 或 Kimi）
+- 网络环境允许访问 LLM Provider 的 API endpoint
+- Spring AI Alibaba 已提供 DeepSeek、通义、Kimi 等主流国产 LLM 的 connector，OryxOS 不需要自行实现协议适配
+- 核心阶段不做 Provider fallback、hedge racing 和成本聚合看板，这些放扩展阶段
+- US-1 完成后没有独立可演示 Demo，需要等 US-2（ReAct 循环）完成后合跑「查天气」Demo
+- Maven 多模块骨架（oryxos-core、oryxos-provider、oryxos-boot 等）在本 US 中一并搭建

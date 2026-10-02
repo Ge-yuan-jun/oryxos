@@ -1,49 +1,54 @@
-# Implementation Plan: Provider——对接大模型的统一入口（第16节）
+# Implementation Plan: Provider 抽象——对接大模型的统一入口
 
-**Branch**: `class-16` | **Date**: 2026-07-09 | **Spec**: [spec.md](./spec.md)
+**Branch**: `dev/first-task` | **Date**: 2026-10-02 | **Spec**: `specs/001-provider-abstraction/spec.md`
 
 **Input**: Feature specification from `/specs/001-provider-abstraction/spec.md`
 
 ## Summary
 
-交付 OryxOS 能力一：多 Provider 显式路由的统一 LLM 调用入口。包含 Profile 的解析加载体系（Profile/ProfileLoader/ProfileRegistry，首个消费方在此故一并交付）、`ProviderService.chat(sessionId, Profile, Prompt)`（显式 name→ChatModel 映射、关闭框架自动工具执行、工具 schema 只翻译不执行）、`llm_calls` 审计的 Day-One 写入（成败都落、失败先落再抛）。deepseek/kimi 经 OpenAI 兼容端点用 `spring-ai-openai`（M6 BOM 已核实含该构件）手工构造 ChatModel，不用 starter 自动装配。
+构建 OryxOS 的 LLM 调用基础层：一个统一的 `ProviderService` 抽象，通过显式的 provider name → `ChatModel` 映射，让上层（未来的 ReAct 循环）不感知具体调的是哪家 LLM。Spring AI Alibaba 吸收各家 LLM 的协议差异，OryxOS 只做薄包装。同时搭建 Maven 多模块骨架、审计表（`llm_calls`）Day One 写入、Mock Provider 内置、Function Calling 格式适配（仅 Schema 生成，禁用自动执行）。
 
 ## Technical Context
 
-**Language/Version**: Java 21（虚拟线程，全程同步阻塞）
+**Language/Version**: Java 21（虚拟线程）
 
-**Primary Dependencies**: Spring Boot 3.3.x、Spring AI `1.0.0-M6`（`spring-ai-openai`，BOM 管理——已从本地 BOM pom 查证存在）、Spring AI Alibaba `1.0.0-M6.1`（保留备用 qwen，禁用其 eager 自动装配）、SnakeYAML（随 spring-boot-starter 传递）、Jackson
+**Primary Dependencies**: Spring Boot 3.x, Spring AI Alibaba（含 OpenAI-compatible / DashScope connectors）, Maven 多模块
 
-**Storage**: SQLite（`sqlite-jdbc` + `hibernate-community-dialects`，均已在 oryxos-storage pom）+ Spring Data JPA；建表走手工 `schema.sql`，禁用 `ddl-auto=update`
+**Storage**: SQLite（默认）+ Spring Data JPA + Flyway 迁移管理（`llm_calls` 审计表从 Day One 写入）
 
-**Testing**: JUnit 5 + Mockito（单测 mock ChatModel）；`@DataJpaTest` + 手工 schema.sql（Repository 测试）；`@Tag("integration")` 冒烟（CI 跳过）
+**Testing**: JUnit 5 + Spring Boot Test + MockProvider（内置 Mock Provider 替代外部 LLM 依赖）
 
-**Target Platform**: 单可执行 fat JAR，企业内网 Linux/macOS
+**Target Platform**: JVM（单 fat JAR，Linux / macOS / Windows）
 
-**Project Type**: Maven 多模块单体中的三个模块（oryxos-core / oryxos-provider / oryxos-storage）
+**Project Type**: Maven 多模块库（US-1 涉及 `oryxos-core`、`oryxos-provider`、`oryxos-storage`、`oryxos-boot` 四个模块）
 
-**Performance Goals**: 本节无独立性能目标（调用耗时由外部 LLM 决定）；审计写入不阻塞主链路可用性
+**Performance Goals**: 首次 LLM 调用 < 5s 响应（排除网络延迟）；同步 + 虚拟线程模型
 
-**Constraints**: `mvn clean verify` 全绿含 Spotless/P3C/Checkstyle/SpotBugs/FindSecBugs/PMD/OWASP；避开 P3C/ASM 解析不了的 Java 18+ 语法形态（如增强 switch `default ->`）；凭证仅环境变量
+**Constraints**:
+- 同步阻塞执行，MUST NOT 引入 Reactor / WebFlux / CompletableFuture
+- Provider 显式映射，MUST NOT 扫描 Spring 容器 ChatModel Bean 做路由
+- Spring AI 仅用于协议转换 + JSON Schema 生成，MUST 禁用自动 tool 执行和 eager 自动装配
+- API key 走环境变量 / `${ENV_VAR}` 占位，MUST NOT 明文写入日志或代码
+- 审计表 `llm_calls` Day One 写入，不可省
 
-**Scale/Scope**: 核心阶段单实例；本节代码量预估 <1.5k 行（含测试）
+**Scale/Scope**: 核心阶段支持同时配置 3+ 个 LLM Provider，互不干扰
 
 ## Constitution Check
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-| 原则 | 关联 | 本 plan 的符合方式 |
-|---|---|---|
-| I 自实现 ReAct（NON-NEG） | 间接 | 本节不实现循环；不引入任何 Spring AI Agent 抽象/ChatClient |
-| II Spring AI 仅协议转换+Schema（NON-NEG） | **核心** | 调用方式 `chatModel.call(new Prompt(...))`；关闭自动工具执行（见 research D2）；禁用 DashScope eager 自动装配（research D3）；手工 `new OpenAiChatModel(...)` 不走 starter 装配 |
-| III Provider 显式映射 | **核心** | 启动按 `oryxos.providers` 配置逐条构造 ChatModel，显式 `Map<String, ChatModel>`；零类型扫描 |
-| IV SKILL.md 归 ContextLoader | 不涉及 | 本节不触碰 Skill/Tool 模块归属 |
-| V 审计 Day One 落库（NON-NEG） | **核心** | `LlmCall` 实体 + Repository + schema.sql 本节交付；成败都写、失败先写再抛 |
-| VI 安全地基（NON-NEG） | 部分 | 凭证 `${ENV}` 占位、启动校验缺失即清晰报错；本节无工具执行故无沙箱调用点 |
-| VII 同步+虚拟线程 | 符合 | 无 Reactor/CompletableFuture/自建线程池 |
-| VIII 配置即 Agent、状态外置 | **核心** | Profile YAML 定义 Agent 模型选择；手工建表脚本；实例内存仅缓存不可变配置索引 |
+| # | 原则 | 级别 | 合规状态 | 说明 |
+|---|------|------|----------|------|
+| I | 自实现 ReAct 循环 | NON-NEG | ✅ PASS | US-1 不涉及 ReAct 循环实现；`ProviderService.call()` 返回原始 LLM 响应，由未来的 ReAct 循环消费，不引入 Spring AI Agent 抽象 |
+| II | Spring AI 仅做协议转换与 Schema 生成 | NON-NEG | ✅ PASS | 明确禁用 Spring AI 自动 tool 执行（`ChatModel.call(Prompt)` 直接调用）；禁用 eager 自动装配（如 `DashScopeAutoConfiguration`） |
+| III | Provider 显式映射 | — | ✅ PASS | `ProviderService` 维护 `Map<String, ChatModel>` 显式映射表，由 `application.yaml` 配置驱动构建，不依赖 Bean 类型扫描 |
+| IV | 目录 = Agent，Skill 软连接 | — | N/A | US-1 不涉及 Agent 目录或 Skill 绑定 |
+| V | 审计 Day One 落库 | NON-NEG | ✅ PASS | `llm_calls` 表在 US-1 就创建并写入；每次 LLM 调用记录 provider name、model、token usage、timestamp |
+| VI | 安全地基 | NON-NEG | ✅ PASS | API key 通过 `${ENV_VAR}` 占位符加载，不出现在日志/代码/提交历史；配置缺失时启动报错 |
+| VII | 同步 + 虚拟线程 | — | ✅ PASS | 全程同步阻塞调用，不引入异步编程模型 |
+| VIII | 目录配置即 Agent | — | N/A | US-1 不涉及 Agent 实例化；只提供 Provider 能力层 |
 
-**Gate 结论：PASS**（无违背项，Complexity Tracking 留空）。
+**Gate 结论**: 全部通过，无违规项。进入 Phase 0。
 
 ## Project Structure
 
@@ -51,53 +56,58 @@
 
 ```text
 specs/001-provider-abstraction/
-├── plan.md
-├── research.md
-├── data-model.md
-├── quickstart.md
-├── contracts/
-│   └── provider-service.md
-└── tasks.md   # /speckit-tasks 产出
+├── plan.md              # This file
+├── research.md          # Phase 0 output
+├── data-model.md        # Phase 1 output
+├── quickstart.md        # Phase 1 output
+├── contracts/           # Phase 1 output
+│   └── provider-service-contract.md
+└── tasks.md             # Phase 2 output (NOT created by /speckit-plan)
 ```
 
 ### Source Code (repository root)
 
 ```text
-oryxos-core/src/main/java/io/oryxos/core/
-├── OryxTool.java                 # 既有 stub：补 getInputSchema()（research D4）
-├── ToolResult.java               # 既有，不动
-└── profile/
-    ├── Profile.java              # 全字段记录类（嵌套 ProviderRef/ScheduleConfig/NotifyChannel/Identity/Settings）
-    ├── ProfileLoader.java        # 扫 .oryxos/profiles/ + SnakeYAML + 校验，坏文件不阻断
-    ├── ProfileRegistry.java      # Map<String,Profile> 内存索引
-    └── ProfileValidationException.java
+oryxos-core/
+└── src/main/java/com/oryxos/core/
+    ├── provider/
+    │   ├── ProviderService.java          # 统一 LLM 调用门面接口
+    │   └── LlmResponse.java             # LLM 响应包装（含 tool calls + token usage）
+    ├── profile/
+    │   └── Profile.java                  # Agent 运行配置（含 provider name 引用）
+    ├── message/
+    │   ├── Message.java                  # 对话消息抽象
+    │   └── MessageRole.java             # 消息角色枚举
+    └── tool/
+        └── OryxTool.java                # 工具抽象接口
 
-oryxos-provider/src/main/java/io/oryxos/provider/
-├── ProviderService.java          # chat(sessionId, Profile, Prompt)（签名逐字保真）
-├── ProviderNotFoundException.java
-├── ProvidersProperties.java      # oryxos.providers 全局层 @ConfigurationProperties
-├── ProviderChatModelFactory.java # 按配置手工构造 ChatModel（OpenAI 兼容端点）
-├── ToolSchemaAdapter.java        # OryxTool → Spring AI 工具描述，只翻译
-└── LlmCallAuditor.java           # 审计接口（写 llm_calls；自身失败 log&continue）
-oryxos-provider/src/test/java/io/oryxos/provider/
-├── ProviderServiceTest.java      # 含课件三个中文名回归测试（原样落地）
-├── ToolSchemaAdapterTest.java
-└── ProviderSmokeIT.java          # @Tag("integration")
-oryxos-core/src/test/java/io/oryxos/core/profile/
-└── ProfileLoaderTest.java
+oryxos-provider/
+└── src/main/java/com/oryxos/provider/
+    ├── DefaultProviderService.java       # ProviderService 实现（显式映射）
+    ├── ProviderProperties.java           # 配置属性绑定
+    ├── ProviderRegistrar.java            # 启动时构建映射表
+    ├── MockChatModel.java                # Mock Provider 实现
+    ├── FunctionCallingAdapter.java       # OryxTool → Spring AI tools 格式转换
+    └── LlmCallAuditor.java              # 审计记录写入
 
-oryxos-storage/src/main/java/io/oryxos/storage/
-├── LlmCall.java                  # JPA 实体
-├── LlmCallRepository.java
-└── JpaLlmCallAuditor.java        # LlmCallAuditor 的 JPA 实现
-oryxos-storage/src/main/resources/
-└── schema.sql                    # llm_calls 手工建表（含 success/error_message）
-oryxos-storage/src/test/java/io/oryxos/storage/
-└── LlmCallRepositoryTest.java    # 建表走 schema.sql，不让 Hibernate 自动建
+oryxos-storage/
+└── src/main/java/com/oryxos/storage/
+    ├── entity/
+    │   └── LlmCallRecord.java           # llm_calls 审计实体
+    ├── repository/
+    │   └── LlmCallRepository.java       # JPA Repository
+    └── db/migration/
+        └── sqlite/
+            └── V1__create_llm_calls.sql  # Flyway 建表迁移
+
+oryxos-boot/
+└── src/main/resources/
+    ├── application.yaml                  # Provider 配置模板
+    └── application-mock.yaml             # Mock Profile（CI 用）
 ```
 
-**Structure Decision**: 按课件模块落位表——Profile 体系归 oryxos-core（下游各节共用）、ProviderService/适配器/审计接口归 oryxos-provider、实体/Repository/建表归 oryxos-storage；审计以接口（provider 模块）+ JPA 实现（storage 模块）解耦，provider 不直接依赖 storage，装配留给 boot（本节测试中直接 mock 接口，不需要完整装配）。
+**Structure Decision**: 遵循技术方案 §10 的 Maven 多模块划分。`oryxos-core` 放接口和抽象，`oryxos-provider` 放实现（依赖倒置），`oryxos-storage` 放持久化，`oryxos-boot` 做装配和配置。US-1 聚焦这四个模块，其余模块（如 `oryxos-tool`、`oryxos-memory`）在后续 US 中填充。
 
 ## Complexity Tracking
 
-无需填写——Constitution Check 无违背项。
+> 无违规项，无需论证。

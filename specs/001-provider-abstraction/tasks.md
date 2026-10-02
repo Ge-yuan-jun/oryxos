@@ -1,83 +1,257 @@
-# Tasks: Provider——对接大模型的统一入口（第16节）
+# Tasks: Provider 抽象——对接大模型的统一入口
 
 **Input**: Design documents from `/specs/001-provider-abstraction/`
 
-**Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/provider-service.md
+**Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/provider-service-contract.md, quickstart.md
 
-**Tests**: 用户显式要求 harness 先行——每个实现任务的测试任务紧邻其前（红→绿）；课件三个中文名关键回归测试必须原样落地。
+**Tests**: Spec 未显式要求 TDD，但 Mock Provider（FR-010）和 quickstart.md 验证场景隐含需要集成测试。按需生成关键验证测试。
 
-**Organization**: 按用户故事分组；US1 为 MVP。
+**Organization**: Tasks grouped by user story (US1–US4) from spec.md, priority order P1→P2→P3.
 
 ## Format: `[ID] [P?] [Story] Description`
 
-## Phase 1: Setup
+- **[P]**: Can run in parallel (different files, no dependencies)
+- **[Story]**: Which user story this task belongs to (e.g., US1, US2, US3, US4)
+- Include exact file paths in descriptions
 
-- [x] T001 在 oryxos-provider/pom.xml 新增 `org.springframework.ai:spring-ai-openai`（版本由根 pom BOM 管理），跑 `mvn -pl oryxos-provider -am dependency:resolve` 确认 1.0.0-M6 解析成功（H3 实核）
-- [x] T002 【停点已确认项】给 oryxos-core/src/main/java/io/oryxos/core/OryxTool.java 补 `String getInputSchema();`（research D4；出处 TechSol §6.1 + 20 节课件预告）
-- [x] T003 【写前 H3 核实】解包本地 `spring-ai-openai-1.0.0-M6.jar`，确认三件事的确切 API：`OpenAiApi` 构造（baseUrl+apiKey）、`OpenAiChatModel` 构造、`OpenAiChatOptions` 上关闭自动执行的开关（候选 `proxyToolCalls`）与工具描述挂载方式（候选 `functionCallbacks`）；把结论追记进 specs/001-provider-abstraction/research.md 的 D1/D2 条目——核实不到 → 软门禁停下报告
+---
 
-## Phase 2: Foundational（阻塞所有故事）
+## Phase 1: Setup (Shared Infrastructure)
 
-- [x] T004 [P] 创建 Profile 记录类族于 oryxos-core/src/main/java/io/oryxos/core/profile/：`Profile`（含嵌套 `Identity`/`ProviderRef`/`NotifyChannel`/`ScheduleConfig`/`Settings`，字段按 data-model.md 全量建齐，record 不可变，`Settings` 缺省 maxIterations=10/maxHistoryTurns=20）+ `ProfileValidationException`
-- [x] T005 [P] 先写测试 oryxos-core/src/test/java/io/oryxos/core/profile/ProfileLoaderTest.java：①合法 YAML 全字段解析（含蛇形→驼峰）②引用不存在的 provider 名报错信息含该名字 ③坏 YAML 文件被跳过、其余 Profile 正常加载（SC-007）④`${ENV}` 占位从环境变量解析 ⑤加载后可从 ProfileRegistry 按 name 查到（用 @TempDir 造 profiles 目录）
-- [x] T006 实现 oryxos-core/src/main/java/io/oryxos/core/profile/ProfileLoader.java（SnakeYAML 扫描 `.oryxos/profiles/*.yaml`；构造注入 `Set<String> knownProviders` 做 provider 名校验——core 不得反向依赖 provider 模块；坏文件记 ERROR 跳过）与 ProfileRegistry.java（`Map<String,Profile>` 内存索引，`get`/`all`），使 T005 全绿
+**Purpose**: Maven 多模块骨架搭建、Spring Boot 基础配置、依赖声明
 
-**Checkpoint**: Profile 体系可用，三个故事可开工。
+- [x] T001 Create/verify Maven multi-module project structure: parent `pom.xml` 声明 `oryxos-core`, `oryxos-provider`, `oryxos-storage`, `oryxos-boot` 四个子模块（其余模块可存在但 US-1 不涉及），统一管理 Spring Boot 3.x + Spring AI Alibaba + JDK 21 版本 in `/pom.xml`
+- [x] T002 [P] Configure `oryxos-core/pom.xml`: 仅声明 Spring AI core 依赖（接口级别），不引入具体 connector
+- [x] T003 [P] Configure `oryxos-provider/pom.xml`: 依赖 `oryxos-core` + Spring AI Alibaba OpenAI connector + DashScope connector
+- [x] T004 [P] Configure `oryxos-storage/pom.xml`: 依赖 `oryxos-core` + Spring Data JPA + SQLite JDBC + Flyway
+- [x] T005 [P] Configure `oryxos-boot/pom.xml`: 依赖 `oryxos-core` + `oryxos-provider` + `oryxos-storage`，Spring Boot Maven Plugin 打 fat JAR
+- [x] T006 [P] Create `oryxos-boot/src/main/java/com/oryxos/boot/OryxOsApplication.java`: Spring Boot 主类，启用虚拟线程（`spring.threads.virtual.enabled=true`）
+- [x] T007 [P] Create `oryxos-boot/src/main/resources/application.yaml`: 基础配置骨架，包含 `spring.datasource`（SQLite）、`spring.jpa`、`spring.flyway`、`spring.autoconfigure.exclude`（排除 Spring AI 自动装配类）
 
-## Phase 3: User Story 1 - 多 Provider 精确路由 + 只翻译不执行（P1）🎯 MVP
+**Checkpoint**: `mvn clean compile` 通过，四个模块编译成功，Spring Boot 应用可启动（无 Provider 配置时跳过 Provider 初始化）
 
-**Goal**: `chat(sessionId, Profile, ProviderRequest)` 按名路由零串台；工具 schema 翻译挂载、自动执行关闭、tool call 原样透传。
+---
 
-**Independent Test**: `ProviderServiceTest` + `ToolSchemaAdapterTest` 全绿（全 mock，无网络）。
+## Phase 2: Foundational (Blocking Prerequisites)
 
-- [x] T007 [P] [US1] 创建值对象与异常于 oryxos-provider/src/main/java/io/oryxos/provider/：`ProviderRequest`（content + `List<OryxTool>` availableTools）、`ProviderResponse`（text + `List<ToolCallRequest>` + `Usage`）、`ToolCallRequest`（name + argumentsJson）、`Usage`（prompt/completion/total）、`ProviderNotFoundException`（消息含 provider 名）——契约见 contracts/provider-service.md，【停点已确认项 D8】
-- [x] T008 [P] [US1] 先写测试 oryxos-provider/src/test/java/io/oryxos/provider/ToolSchemaAdapterTest.java：OryxTool 的 name/description/inputSchema 翻译后字段一一对齐；产物不含任何执行逻辑（纯描述对象）；空工具列表返回空
-- [x] T009 [US1] 实现 oryxos-provider/src/main/java/io/oryxos/provider/ToolSchemaAdapter.java（OryxTool → Spring AI 工具描述，按 T003 核实的挂载方式），使 T008 全绿
-- [x] T010 [US1] 先写测试 oryxos-provider/src/test/java/io/oryxos/provider/ProviderServiceTest.java（mock ChatModel + mock LlmCallAuditor）：**课件回归①** `按名路由_两个provider不串台`（verify 目标家 times(1)、另一家 never()）；**课件回归③** `带工具schema调用_请求里关闭了自动执行`（ArgumentCaptor 抓请求断言自动执行开关关闭且工具描述已挂载）；未知 provider 名抛 `ProviderNotFoundException` 且消息含名字；model 与 temperature 取自 Profile、temperature 缺省时不设置（D6）
-- [x] T011 [US1] 定义审计接口 oryxos-provider/src/main/java/io/oryxos/provider/LlmCallAuditor.java（`record(sessionId, provider, model, Usage, success, errorMessage, durationMs)`），实现 ProviderService.java：显式 `Map<String,ChatModel>` 构造注入、`chat` 按契约路由/翻译/调用/成功审计/返回，使 T010 当前用例全绿
-- [x] T012 [US1] 实现 oryxos-provider/src/main/java/io/oryxos/provider/ProvidersProperties.java（`oryxos.providers` 列表：name/api-key/base-url，启动校验：名不重复、env 解析后非空缺失即点名报错）与 ProviderChatModelFactory.java（按配置手工 `new OpenAiApi`/`new OpenAiChatModel` 构造映射表——按 T003 核实的签名；不使用任何 starter 自动装配），并为 Properties 校验补测试用例入 ProviderServiceTest 或独立小节
+**Purpose**: 核心抽象和持久化基础，所有 User Story 依赖这些类型
 
-**Checkpoint**: US1 独立可验——MVP 达成。
+**⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-## Phase 4: User Story 2 - 成败都留痕的审计（P2）
+- [x] T008 [P] Create `MessageRole` enum in `oryxos-core/src/main/java/com/oryxos/core/message/MessageRole.java`: 四个值 SYSTEM, USER, ASSISTANT, TOOL
+- [x] T009 [P] Create `ToolCall` value object in `oryxos-core/src/main/java/com/oryxos/core/message/ToolCall.java`: fields id (String, NOT NULL), name (String, NOT NULL), arguments (String, NOT NULL)
+- [x] T010 [P] Create `Message` data class in `oryxos-core/src/main/java/com/oryxos/core/message/Message.java`: fields role (MessageRole, NOT NULL), content (String, NULLABLE), toolCalls (List\<ToolCall\>, NULLABLE), toolCallId (String, NULLABLE), name (String, NULLABLE); provide static factory methods `userMessage(content)`, `systemMessage(content)`, `assistantMessage(content, toolCalls)`, `toolMessage(toolCallId, name, content)`
+- [x] T011 [P] Create `TokenUsage` value object in `oryxos-core/src/main/java/com/oryxos/core/provider/TokenUsage.java`: fields inputTokens (long, >= 0), outputTokens (long, >= 0), totalTokens (long, >= 0)
+- [x] T012 [P] Create `LlmResponse` value object in `oryxos-core/src/main/java/com/oryxos/core/provider/LlmResponse.java`: fields content (String, NULLABLE), toolCalls (List\<ToolCall\>, NULLABLE), tokenUsage (TokenUsage, NOT NULL), finishReason (String, NULLABLE); provide `hasToolCalls()` convenience method
+- [x] T013 [P] Create `OryxTool` interface in `oryxos-core/src/main/java/com/oryxos/core/tool/OryxTool.java`: methods getName() → String, getDescription() → String, getParameterSchema() → Class\<?\>, execute(String argsJson) → String
+- [x] T014 [P] Create `Profile` data class in `oryxos-core/src/main/java/com/oryxos/core/profile/Profile.java`: fields name (String, NOT NULL, UNIQUE), provider (String, NOT NULL), model (String, NULLABLE), maxHistoryTurns (int, DEFAULT 20), maxIterations (int, DEFAULT 10)
+- [x] T015 [P] Create `ProviderService` interface in `oryxos-core/src/main/java/com/oryxos/core/provider/ProviderService.java`: methods `call(String providerName, String model, List<Message> messages, List<OryxTool> tools) → LlmResponse`, `listProviders() → List<String>`, `hasProvider(String providerName) → boolean` per contracts/provider-service-contract.md
+- [x] T016 [P] Create `ProviderNotFoundException` in `oryxos-core/src/main/java/com/oryxos/core/provider/ProviderNotFoundException.java`: extends RuntimeException, includes providerName field
+- [x] T017 [P] Create `ProviderCallException` in `oryxos-core/src/main/java/com/oryxos/core/provider/ProviderCallException.java`: extends RuntimeException, includes providerName, model, and cause fields
+- [x] T018 [P] Create `LlmCallRecord` JPA entity in `oryxos-storage/src/main/java/com/oryxos/storage/entity/LlmCallRecord.java`: fields id (Long, PK AUTO_INCREMENT), providerName (String, NOT NULL), model (String, NOT NULL), inputTokens (long, NOT NULL DEFAULT 0), outputTokens (long, NOT NULL DEFAULT 0), totalTokens (long, NOT NULL DEFAULT 0), durationMs (long, NOT NULL), success (boolean, NOT NULL), errorMessage (String, NULLABLE), createdAt (Instant, NOT NULL); map to table `llm_calls`
+- [x] T019 [P] Create `LlmCallRepository` in `oryxos-storage/src/main/java/com/oryxos/storage/repository/LlmCallRepository.java`: extends JpaRepository\<LlmCallRecord, Long\>
+- [x] T020 Create Flyway migration `oryxos-storage/src/main/resources/db/migration/sqlite/V1__create_llm_calls.sql`: CREATE TABLE llm_calls with columns id INTEGER PRIMARY KEY AUTOINCREMENT, provider_name TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL, success INTEGER NOT NULL, error_message TEXT, created_at TEXT NOT NULL
 
-**Goal**: 每次调用恰好一条 llm_calls；失败先落 success=false 带原因再上抛；审计自身失败 log&continue。
+**Checkpoint**: 所有核心类型编译通过，Flyway 迁移在启动时自动创建 `llm_calls` 表。`ProviderService` 接口已定义但无实现。
 
-**Independent Test**: `ProviderServiceTest` 失败路径用例 + `LlmCallRepositoryTest` 全绿。
+---
 
-- [x] T013 [US2] 在 ProviderServiceTest.java 补 **课件回归②** `调用失败_审计必须留下success为false的记录`（mock ChatModel 抛异常 → assertThrows 且 verify auditor 收到 success=false + contains 原因）；补"审计自身抛异常时调用结果不受影响"用例（D5）
-- [x] T014 [US2] 在 ProviderService.java 补失败路径（catch RuntimeException → 先审计后 rethrow）；auditor 调用外层不包裹——log&continue 语义放实现侧（见 T016），使 T013 全绿
-- [x] T015 [P] [US2] 先写测试 oryxos-storage/src/test/java/io/oryxos/storage/LlmCallRepositoryTest.java：`@DataJpaTest` + `ddl-auto=none` + 显式执行 schema.sql + SQLite 文件库（@TempDir）；写入一条 success=true 与一条 success=false 带 error_message，读回字段完整——建表必须走手工脚本
-- [x] T016 [US2] 实现 oryxos-storage：src/main/resources/schema.sql（llm_calls 建表，列按 data-model.md）、LlmCall.java 实体、LlmCallRepository.java、JpaLlmCallAuditor.java（实现 LlmCallAuditor；内部 catch 任意异常记 ERROR 日志不上抛——D5），使 T015 全绿
+## Phase 3: User Story 1 — 单 Provider 对话调用 (Priority: P1) 🎯 MVP
 
-**Checkpoint**: US2 独立可验。
+**Goal**: 配置一个 LLM Provider（如 DeepSeek），通过 `ProviderService.call()` 发送对话请求并获得有效 LLM 响应，每次调用写入审计记录。
 
-## Phase 5: User Story 3 - 配置即运维（P3）
+**Independent Test**: 配置一个 DeepSeek Provider，调用 `ProviderService.call("deepseek", null, [userMessage("你好")], [])` 验证返回有效文本响应，查询 `llm_calls` 表确认审计记录存在。
 
-**Goal**: 换模型零代码、坏配置不拖垮、无明文凭证——大部分行为已由 Phase 2/3 覆盖，此处补齐剩余断言。
+### Implementation for User Story 1
 
-**Independent Test**: 下列用例全绿 + grep 无明文（人工项留验收报告）。
+- [x] T021 [US1] Create `ProviderProperties` configuration binding in `oryxos-provider/src/main/java/com/oryxos/provider/ProviderProperties.java`: `@ConfigurationProperties("oryxos")` 绑定 `providers` 列表，每个元素包含 name (String, NOT NULL, UNIQUE), type (String, NOT NULL, enum: openai/dashscope/mock), model (String, NOT NULL), apiKey (String, NULLABLE for mock), baseUrl (String, NULLABLE); `toString()` MUST NOT output apiKey
+- [x] T022 [US1] Create `LlmCallAuditor` in `oryxos-provider/src/main/java/com/oryxos/provider/LlmCallAuditor.java`: 接收 providerName, model, TokenUsage, durationMs, success, errorMessage 参数，构建 `LlmCallRecord` 并通过 `LlmCallRepository.save()` 同步写入；依赖 `oryxos-storage` 的 repository
+- [x] T023 [US1] Create `ProviderRegistrar` in `oryxos-provider/src/main/java/com/oryxos/provider/ProviderRegistrar.java`: `@Component` 在 `@PostConstruct` 中遍历 `ProviderProperties.providers`，按 type 创建对应的 `ChatModel` 实例（openai → `OpenAiChatModel`，dashscope → `DashScopeChatModel`，mock → defer to T030），构建 `Map<String, ChatModel>` 映射表；启动时校验：name 不重复（重复则抛 IllegalStateException 含重复 name）、非 mock 的 apiKey 非空非空白（缺失则抛 IllegalStateException 含 provider name 和环境变量提示）、type 是已知类型
+- [x] T024 [US1] Create `DefaultProviderService` in `oryxos-provider/src/main/java/com/oryxos/provider/DefaultProviderService.java`: 实现 `ProviderService` 接口；`call()` 方法从 `ProviderRegistrar` 的映射表中按 providerName 查找 `ChatModel`（未找到抛 `ProviderNotFoundException`）；将 `List<Message>` 转换为 Spring AI 的 `Prompt` 对象（Message → Spring AI `AbstractMessage` 子类映射）；调用 `chatModel.call(prompt)` 获取响应；提取 content、tool calls、token usage 构建 `LlmResponse`；记录耗时，通过 `LlmCallAuditor` 写审计；异常时捕获并包装为 `ProviderCallException`，同样写审计（success=false）
+- [x] T025 [US1] Create `ProviderAutoConfiguration` in `oryxos-provider/src/main/java/com/oryxos/provider/ProviderAutoConfiguration.java`: `@Configuration` + `@EnableConfigurationProperties(ProviderProperties.class)` + `@ComponentScan` 扫描 provider 包；在 `oryxos-provider/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 中注册
+- [x] T026 [US1] Add provider configuration to `oryxos-boot/src/main/resources/application.yaml`: 添加 `oryxos.providers` 配置示例（至少包含一个 openai type 的 provider，api-key 使用 `${DEEPSEEK_API_KEY:}` 占位符，base-url 配置 DeepSeek endpoint）；确保 `spring.autoconfigure.exclude` 包含 Spring AI 的自动配置类（如 `org.springframework.ai.autoconfigure.openai.OpenAiAutoConfiguration`）
+- [x] T027 [US1] Add Flyway configuration to `oryxos-boot/src/main/resources/application.yaml`: 配置 `spring.flyway.locations=classpath:db/migration/sqlite`，确保启动时自动执行迁移
 
-- [x] T017 [US3] 在 ProfileLoaderTest.java 补"改 model 字段重新加载后 Profile.provider().model() 生效"用例；在 ProviderServiceTest.java 确认请求里 model 来自 Profile（若 T010 已覆盖则标注引用即可，不重复写）
+**Checkpoint**: 设置 `DEEPSEEK_API_KEY` 环境变量后 `mvn clean package && java -jar oryxos-boot/target/oryxos-boot-*.jar` 启动成功，日志输出 "Registered providers: [deepseek]"，`llm_calls` 表已创建。可通过编程方式调用 `ProviderService.call("deepseek", null, messages, [])` 获得响应。
 
-## Phase 6: Polish & Cross-Cutting
+---
 
-- [x] T018 [P] 编写 oryxos-provider/src/test/java/io/oryxos/provider/ProviderSmokeIT.java：`@Tag("integration")`，读环境变量真 key、真调一次、断言非空响应且 llm_calls +1 success=true；surefire 配置默认排除 integration 组（CI 跳过）
-- [x] T019 跑 `mvn clean verify` 修复全部静态检查（Spotless/P3C/Checkstyle/SpotBugs/FindSecBugs/PMD/OWASP）直至全绿——注意语法禁区（P3C 对增强 switch `default ->` 误报）
-- [x] T020 H4 六条全局不变量脚本化自查（grep 无明文 key / 无 CompletableFuture/Reactor / 无 ChatClient 自动执行路径），把证据写入验收报告草稿
+## Phase 4: User Story 2 — 多 Provider 并存与切换 (Priority: P2)
 
-## Dependencies
+**Goal**: 同时配置多个 LLM Provider（如 DeepSeek + Kimi），不同 Profile 引用不同 Provider，运行时按 provider name 路由到正确的 ChatModel。
 
-- Phase 1 → Phase 2 → US1(Phase 3) → US2(Phase 4) → US3(Phase 5) → Polish。
-- US2 依赖 US1 的 ProviderService/LlmCallAuditor 接口；US3 仅补断言，依赖 Phase 2/3。
-- T003（API 核实）阻塞 T009/T011/T012（写前 H3）。
+**Independent Test**: 配置 deepseek 和 kimi 两个 Provider，分别调用 `call("deepseek", ...)` 和 `call("kimi", ...)`，验证路由正确且各自有独立的审计记录；调用 `call("nonexistent", ...)` 验证抛出 `ProviderNotFoundException`。
 
-## Parallel Examples
+### Implementation for User Story 2
 
-- Phase 2：T004 ∥ T005（不同文件）。
-- US1：T007 ∥ T008 可并行；T010 可与 T009 并行起草。
-- US2：T015 与 T013 并行（不同模块）。
+- [x] T028 [US2] Extend `oryxos-boot/src/main/resources/application.yaml` provider configuration: 添加第二个 provider 配置（如 kimi，type: openai, api-key: `${KIMI_API_KEY:}`, base-url: Kimi endpoint）和 mock provider（type: mock, 无需 api-key）
+- [x] T029 [US2] Add duplicate provider name detection in `ProviderRegistrar` (if not already covered by T023): 确保当 `oryxos.providers` 列表中出现重复 name 时，启动失败并输出错误信息 "Duplicate provider name: '{name}'"；同时验证 `listProviders()` 返回所有已注册 name，`hasProvider()` 正确判断
+
+**Checkpoint**: 同时设置 `DEEPSEEK_API_KEY` 和 `KIMI_API_KEY` 后启动，日志输出 "Registered providers: [deepseek, kimi, mock]"。分别调用三个 provider 均正常工作且互不干扰。
+
+---
+
+## Phase 5: User Story 3 — Function Calling 格式适配 (Priority: P2)
+
+**Goal**: `OryxTool` 列表能被正确转换为 Spring AI 的 Function Calling 格式，LLM 调用时携带 tools 参数，返回的 tool_call 能被正确解析为 `ToolCall` 对象。禁用 Spring AI 自动 tool 执行。
+
+**Independent Test**: 创建一个测试用 `OryxTool`（如 get_weather），调用 `ProviderService.call(provider, null, messages, [get_weather])` 验证请求中包含 tool JSON Schema，LLM 返回的 `tool_call` 被正确提取到 `LlmResponse.toolCalls`。
+
+### Implementation for User Story 3
+
+- [x] T030 [US3] Create `FunctionCallingAdapter` in `oryxos-provider/src/main/java/com/oryxos/provider/FunctionCallingAdapter.java`: 将 `List<OryxTool>` 转换为 Spring AI 的 `List<FunctionCallback>`；每个 `OryxTool` 映射为一个 `FunctionCallback`，使用 Spring AI 的 JSON Schema 生成能力（基于 `getParameterSchema()` 返回的 Class 生成参数 schema）；回调的 `apply()` 方法 MUST NOT 自动执行 tool——仅作占位以满足 `FunctionCallback` 接口，实际执行由上层 ReAct 循环控制
+- [x] T031 [US3] Integrate `FunctionCallingAdapter` into `DefaultProviderService.call()`: 当 tools 列表非空时，通过 `FunctionCallingAdapter` 转换后设置到 `ChatOptions`（如 `OpenAiChatOptions.builder().withFunctions(...)` 或等效方式）传入 `Prompt`；解析 LLM 响应中的 tool_call（Spring AI 的 `AssistantMessage.getToolCalls()`），映射为 `ToolCall` 列表放入 `LlmResponse.toolCalls`
+
+**Checkpoint**: 使用 Mock Provider 或真实 Provider，传入一个 OryxTool 调用 `ProviderService.call()`，验证 LLM 响应中的 `toolCalls` 字段包含正确的 tool name 和 arguments JSON。
+
+---
+
+## Phase 6: User Story 4 — API Key 安全加载 (Priority: P3)
+
+**Goal**: API key 通过环境变量安全加载，不出现在代码/日志/提交历史中。配置缺失时给出明确的启动失败提示。
+
+**Independent Test**: 设置环境变量验证 Provider 正常工作；不设置环境变量验证启动报错包含缺失配置项信息；检查日志输出不包含 API key。
+
+### Implementation for User Story 4
+
+- [x] T032 [US4] Add Logback configuration in `oryxos-boot/src/main/resources/logback-spring.xml`: 配置结构化 JSON 日志格式（生产环境）和可读格式（开发环境）；确保不记录请求 headers 或敏感配置值
+- [x] T033 [US4] Verify API key masking in startup logs: 确保 `ProviderRegistrar` 的启动日志只输出 provider name 和 model，不输出 apiKey 或 baseUrl 中的敏感信息；`ProviderProperties.toString()` 对 apiKey 字段输出 "***" 而非实际值
+- [x] T034 [US4] Verify empty/blank API key validation: 确保 `ProviderRegistrar` 对空字符串 `""` 和空白字符串 `"  "` 的 apiKey 也视为缺失，报告明确错误 "Provider '{name}' API key is blank or missing. Set environment variable {VAR_NAME}"
+
+**Checkpoint**: 启动日志中无 API key 泄露；故意不配置环境变量时启动失败并输出友好错误信息。
+
+---
+
+## Phase 7: Mock Provider (FR-010, Edge Cases)
+
+**Goal**: 内置 Mock Provider 支持无 API key 全链路验证和 CI 测试，包括 Function Calling 模拟。
+
+**Independent Test**: 使用 `application-mock.yaml` 启动，调用 `ProviderService.call("mock", ...)` 验证返回固定文本；传入 tools 验证返回模拟的 tool_call。
+
+### Implementation
+
+- [x] T035 Create `MockChatModel` in `oryxos-provider/src/main/java/com/oryxos/provider/MockChatModel.java`: 实现 Spring AI `ChatModel` 接口；`call(Prompt)` 返回可配置的固定文本响应（默认 "This is a mock response from OryxOS Mock Provider."）；当 Prompt 中包含 FunctionCallback 且配置了 mock tool calls 时，返回包含 `tool_call` 的 `AssistantMessage`（tool name 取第一个可用 tool，arguments 为预设 JSON `{}`）；返回固定 `TokenUsage`（input=10, output=20, total=30）
+- [x] T036 Integrate `MockChatModel` into `ProviderRegistrar`: 当 provider type 为 `mock` 时，创建 `MockChatModel` 实例（不需要 apiKey 校验）
+- [x] T037 [P] Create `oryxos-boot/src/main/resources/application-mock.yaml`: 配置 `oryxos.providers` 仅包含 mock provider（name: mock, type: mock, model: mock-model），用于 CI 和开发者无 API key 场景
+
+**Checkpoint**: `java -jar oryxos-boot-*.jar --spring.profiles.active=mock` 启动成功，调用 mock provider 返回固定响应且审计记录写入 `llm_calls` 表。
+
+---
+
+## Phase 8: Polish & Cross-Cutting Concerns
+
+**Purpose**: 错误透传验证、edge case 覆盖、quickstart 场景验证
+
+- [ ] T038 [P] Verify error passthrough (FR-011): 配置一个指向不存在域名的 provider，调用后确认抛出 `ProviderCallException` 且审计表记录 success=false, error_message 非空
+- [ ] T039 [P] Verify Spring AI auto-config exclusion (FR-009): 确认 `spring.autoconfigure.exclude` 中包含所有 Spring AI 自动配置类，无 API key 的 provider 不会阻断启动（仅 `ProviderRegistrar` 的显式校验会报错）
+- [ ] T040 [P] Verify API key not in logs (edge case): 搜索启动日志和调用日志，确认无 API key 泄露
+- [ ] T041 Run quickstart.md Scenario 1-6 validation: 按 quickstart.md 中的 6 个场景依次验证（Mock 全链路、FC 模拟、真实 Provider、多 Provider 路由、配置校验、错误透传）
+
+---
+
+## Dependencies & Execution Order
+
+### Phase Dependencies
+
+- **Setup (Phase 1)**: No dependencies — can start immediately
+- **Foundational (Phase 2)**: Depends on Phase 1 — BLOCKS all user stories
+- **US1 (Phase 3)**: Depends on Phase 2 — core single-provider path
+- **US2 (Phase 4)**: Depends on Phase 3 (T023 already handles multi-provider, but validation needs single-provider path working first)
+- **US3 (Phase 5)**: Depends on Phase 3 (needs working `DefaultProviderService` to integrate FC adapter)
+- **US4 (Phase 6)**: Depends on Phase 3 (needs working provider to verify log masking)
+- **Mock Provider (Phase 7)**: Can start after Phase 2, parallel with US1 (MockChatModel is independent); integrate into ProviderRegistrar after T023
+- **Polish (Phase 8)**: Depends on all previous phases
+
+### User Story Dependencies
+
+- **US1 (P1)**: After Foundational → MVP milestone
+- **US2 (P2)**: After US1 → multi-provider routing adds on top of single-provider
+- **US3 (P2)**: After US1 → FC adapter integrates into existing `call()` method
+- **US4 (P3)**: After US1 → security hardening layer on top of working provider
+- **Mock Provider**: After Foundational, parallel with US1; T036 integrates after T023
+
+### Within Each User Story
+
+- Configuration/properties before service implementation
+- Service implementation before integration/validation
+- Auditor before service (US1: T022 before T024)
+
+### Parallel Opportunities
+
+- **Phase 1**: T002, T003, T004, T005, T006, T007 all [P]
+- **Phase 2**: T008–T020 all [P] (different files, no dependencies)
+- **Phase 3**: T021, T022 [P] (both needed by T024 but independent of each other)
+- **Phase 7**: T035, T037 [P]; Phase 7 can run parallel with Phase 3–5 (MockChatModel is self-contained)
+- **Phase 8**: T038, T039, T040 all [P]
+
+---
+
+## Parallel Example: Phase 2 (Foundational)
+
+```text
+# All foundational types can be created in parallel (different files):
+Task T008: MessageRole enum
+Task T009: ToolCall value object
+Task T010: Message data class
+Task T011: TokenUsage value object
+Task T012: LlmResponse value object
+Task T013: OryxTool interface
+Task T014: Profile data class
+Task T015: ProviderService interface
+Task T016: ProviderNotFoundException
+Task T017: ProviderCallException
+Task T018: LlmCallRecord entity
+Task T019: LlmCallRepository
+Task T020: Flyway migration
+```
+
+## Parallel Example: User Story 1
+
+```text
+# These can run in parallel:
+Task T021: ProviderProperties (config binding)
+Task T022: LlmCallAuditor (audit writer)
+
+# Then sequentially:
+Task T023: ProviderRegistrar (depends on T021)
+Task T024: DefaultProviderService (depends on T022, T023)
+Task T025: ProviderAutoConfiguration (depends on T024)
+Task T026-T027: Boot configuration (depends on T025)
+```
+
+---
 
 ## Implementation Strategy
 
-MVP = Phase 1+2+3（US1）：mock 审计接口即可交付"能路由、不执行工具"的最小闭环；US2 补真实落库；US3 只是断言收口。每完成一个任务跑该模块测试（任务级 DoD），不攒账。
+### MVP First (User Story 1 Only)
+
+1. Complete Phase 1: Maven skeleton + Boot config
+2. Complete Phase 2: All core abstractions + audit table
+3. Complete Phase 3: Single provider call works end-to-end
+4. **STOP and VALIDATE**: Call `ProviderService.call("deepseek", null, messages, [])` → valid response + audit record
+5. This is the minimum viable Provider abstraction
+
+### Incremental Delivery
+
+1. Setup + Foundational → compilation passes, types defined
+2. Add US1 → single Provider call works (MVP!)
+3. Add Mock Provider (Phase 7) → CI-friendly, no API key needed
+4. Add US2 → multi-provider routing verified
+5. Add US3 → Function Calling adapter integrated
+6. Add US4 → security hardened
+7. Polish → edge cases covered, quickstart validated
+
+### Key Risk: Spring AI API Surface
+
+Spring AI Alibaba 的 API 在快速迭代中，`ChatModel.call()` 的参数签名、`FunctionCallback` 的构造方式可能因版本不同而变化。T024 和 T030 实现时需对当前 Spring AI 版本做 API 确认。
+
+---
+
+## Notes
+
+- [P] tasks = different files, no dependencies
+- [Story] label maps task to specific user story for traceability
+- US-1 完成后没有用户可见入口（无 CLI / Web），需要 US-2（ReAct 循环）完成后才有 Demo
+- 现有实现被忽略——所有任务按从零构建设计
+- 宪法原则 V（审计 Day One 落库）要求 `llm_calls` 写入贯穿所有 Provider 调用路径，包括 Mock Provider
+- Commit after each task or logical group

@@ -1,66 +1,134 @@
-# Data Model: Provider（第16节）
+# Data Model: Provider 抽象——对接大模型的统一入口
 
-## Profile（oryxos-core，YAML → Java 记录）
+**Feature**: 001-provider-abstraction | **Date**: 2026-10-02
 
-一个 Agent 的完整配置载体。本节建全字段、只校验/消费 provider 段；其余字段供后续各节取用。
+## Entities
 
-| 字段 | 类型 | 说明 | 校验（本节） |
-|---|---|---|---|
-| name | String | 唯一标识 | 非空 |
-| description | String | 描述 | — |
-| identity | Identity(agentName, prompt) | 人格设定 | — |
-| provider | ProviderRef(name, model, temperature) | 模型选择 | name 必须存在于全局 providers 清单；model 非空；temperature 可空（D6） |
-| tools | List<String> | 可用工具名 | — |
-| skills | List<String> | 引用的 SKILL.md | — |
-| mcpServers | List<String> | 引用的 MCP server | — |
-| channels | List<String> | 接入渠道 | — |
-| notifyChannels | List<NotifyChannel(type, config:Map)> | 通知渠道（19 节用） | — |
-| schedules | List<ScheduleConfig(id, cron, zone, message)> | 定时（25 节用） | — |
-| bootstrap | List<String> | Bootstrap 文件 | — |
-| settings | Settings(maxIterations=10, maxHistoryTurns=20) | 循环参数 | 缺省取默认值 |
+### 1. Profile（核心抽象，定义在 `oryxos-core`）
 
-**加载规则（ProfileLoader）**：扫 `.oryxos/profiles/*.yaml`；单文件解析/校验失败 → 记 ERROR、跳过、继续其余（SC-007）；YAML 字段名蛇形（`notify_channels`）映射驼峰。
+Agent 的运行时配置。US-1 阶段只需其中与 Provider 相关的字段，其余字段在后续 US 中扩展。
 
-**ProfileRegistry**：`Map<String, Profile>`（不可变视图对外），按 name 查找；本节仅启动扫描注册一条路径。
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| name | String | NOT NULL, UNIQUE | Agent 标识名 |
+| provider | String | NOT NULL | 引用的 provider name，必须在 ProviderService 映射表中存在 |
+| model | String | NULLABLE | 可选的模型覆盖（如果不指定，使用 Provider 配置中的默认模型） |
+| maxHistoryTurns | int | DEFAULT 20 | 上下文保留轮数（US-2 使用） |
+| maxIterations | int | DEFAULT 10 | ReAct 最大迭代次数（US-2 使用） |
 
-## ProvidersProperties（oryxos-provider，application.yaml 全局层）
+> Profile 在 US-1 阶段不持久化到数据库，只作为内存数据结构。后续从 AGENT.md frontmatter 派生。
 
-```yaml
-oryxos:
-  providers:
-    - name: deepseek
-      api-key: ${DEEPSEEK_API_KEY}
-      base-url: https://api.deepseek.com          # OpenAI 兼容端点
-    - name: kimi
-      api-key: ${KIMI_API_KEY}
-      base-url: https://api.moonshot.cn/v1
+### 2. Message（核心抽象，定义在 `oryxos-core`）
+
+对话消息。US-1 阶段需要此结构以组装 LLM 调用的 Prompt。
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| role | MessageRole | NOT NULL | SYSTEM / USER / ASSISTANT / TOOL |
+| content | String | NULLABLE | 文本内容（tool_call 消息可为空） |
+| toolCalls | List\<ToolCall\> | NULLABLE | LLM 返回的工具调用请求列表 |
+| toolCallId | String | NULLABLE | 工具执行结果消息的关联 ID |
+| name | String | NULLABLE | 工具名称（TOOL 角色消息） |
+
+### 3. ToolCall（值对象，定义在 `oryxos-core`）
+
+LLM 返回的工具调用请求。
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | String | NOT NULL | 调用 ID（LLM 生成） |
+| name | String | NOT NULL | 工具名称 |
+| arguments | String | NOT NULL | 参数 JSON 字符串 |
+
+### 4. LlmResponse（值对象，定义在 `oryxos-core`）
+
+`ProviderService.call()` 的返回结果。
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| content | String | NULLABLE | LLM 返回的文本内容 |
+| toolCalls | List\<ToolCall\> | NULLABLE | 如果 LLM 请求调用工具 |
+| tokenUsage | TokenUsage | NOT NULL | token 用量统计 |
+| finishReason | String | NULLABLE | 结束原因（stop / tool_calls 等） |
+
+### 5. TokenUsage（值对象，定义在 `oryxos-core`）
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| inputTokens | long | >= 0 | 输入 token 数 |
+| outputTokens | long | >= 0 | 输出 token 数 |
+| totalTokens | long | >= 0 | 总 token 数 |
+
+### 6. OryxTool（接口，定义在 `oryxos-core`）
+
+工具的内部抽象。US-1 阶段只定义接口，不实现具体工具（留给 US-2）。
+
+| Method | Return | Description |
+|--------|--------|-------------|
+| getName() | String | 工具唯一名称 |
+| getDescription() | String | 工具描述（进入 JSON Schema） |
+| getParameterSchema() | Class\<?\> | 参数 POJO 类型（Spring AI 据此生成 JSON Schema） |
+| execute(String argsJson) | String | 执行工具，返回文本结果 |
+
+### 7. ProviderConfig（配置值对象，定义在 `oryxos-provider`）
+
+从 `application.yaml` 绑定的单个 Provider 配置。
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| name | String | NOT NULL, UNIQUE | provider 唯一标识 |
+| type | String | NOT NULL | connector 类型：`openai` / `dashscope` / `mock` |
+| model | String | NOT NULL | 默认模型名 |
+| apiKey | String | NULLABLE（mock 可为空） | API key，通过 `${ENV_VAR}` 解析 |
+| baseUrl | String | NULLABLE | 自定义 API endpoint |
+
+**Validation Rules**:
+- name 不能重复，启动时检测重复报错（FR-008）
+- 非 mock 类型的 apiKey 不能为空或空白字符串
+- type 必须是已知的 connector 类型之一
+
+### 8. LlmCallRecord（审计实体，定义在 `oryxos-storage`，持久化到 `llm_calls` 表）
+
+| Field | Type | DB Column | Constraints | Description |
+|-------|------|-----------|-------------|-------------|
+| id | Long | id | PK, AUTO_INCREMENT | 主键 |
+| providerName | String | provider_name | NOT NULL | Provider 名称 |
+| model | String | model | NOT NULL | 使用的模型 |
+| inputTokens | long | input_tokens | NOT NULL, DEFAULT 0 | 输入 token 数 |
+| outputTokens | long | output_tokens | NOT NULL, DEFAULT 0 | 输出 token 数 |
+| totalTokens | long | total_tokens | NOT NULL, DEFAULT 0 | 总 token 数 |
+| durationMs | long | duration_ms | NOT NULL | 调用耗时（毫秒） |
+| success | boolean | success | NOT NULL | 是否成功 |
+| errorMessage | String | error_message | NULLABLE | 失败时的错误信息 |
+| createdAt | Instant | created_at | NOT NULL | 记录时间戳 |
+
+**Flyway Migration** (`V1__create_llm_calls.sql`):
+
+```sql
+CREATE TABLE llm_calls (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_name TEXT    NOT NULL,
+    model         TEXT    NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens  INTEGER NOT NULL DEFAULT 0,
+    duration_ms   INTEGER NOT NULL,
+    success       INTEGER NOT NULL,
+    error_message TEXT,
+    created_at    TEXT    NOT NULL
+);
 ```
 
-| 字段 | 说明 | 校验 |
-|---|---|---|
-| name | provider 唯一名，映射表的 key | 非空、不重复 |
-| api-key | `${ENV}` 占位，启动解析 | 解析后为空 → 启动报错点名哪个变量缺失 |
-| base-url | OpenAI 兼容端点地址 | 非空 |
+## Entity Relationships
 
-## LlmCall（oryxos-storage，JPA 实体 ↔ llm_calls 表）
+```text
+Profile --[references]--> ProviderConfig.name (provider name 字符串引用)
+ProviderService --[maintains]--> Map<String(provider name), ChatModel>
+ProviderService.call() --[produces]--> LlmResponse
+ProviderService.call() --[audits]--> LlmCallRecord (写入 llm_calls 表)
+FunctionCallingAdapter --[converts]--> List<OryxTool> → List<FunctionCallback>
+```
 
-| 列 | 类型 | 说明 |
-|---|---|---|
-| id | INTEGER PK AUTOINCREMENT | 主键 |
-| session_id | VARCHAR NOT NULL | 会话关联 |
-| provider | VARCHAR NOT NULL | provider 名 |
-| model | VARCHAR NOT NULL | 模型名 |
-| prompt_tokens | INTEGER | 输入 token（失败时可空） |
-| completion_tokens | INTEGER | 输出 token（失败时可空） |
-| total_tokens | INTEGER | 合计（失败时可空） |
-| success | BOOLEAN NOT NULL | 成败标识 |
-| error_message | TEXT | 失败原因（成功时空） |
-| duration_ms | INTEGER NOT NULL | 耗时 |
-| created_at | TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP | 记录时间 |
+## State Transitions
 
-建表：`oryxos-storage/src/main/resources/schema.sql` 手工维护；测试与运行都执行此脚本（`ddl-auto=none`）。
-
-## 状态与不变量
-
-- Profile 加载后不可变（record）；Registry 只增不改（本节）。
-- 每次 `chat` 调用 ↔ 恰好一条 LlmCall（成或败）；失败路径先写记录后抛异常（FR-005）。
+无状态机——Provider 调用是无状态的请求-响应模型。`LlmCallRecord` 一旦写入不可变。

@@ -1,7 +1,7 @@
-# Specification Quality Checklist: Provider——对接大模型的统一入口（第16节）
+# Specification Quality Checklist: Provider 抽象
 
 **Purpose**: Validate specification completeness and quality before proceeding to planning
-**Created**: 2026-07-09
+**Created**: 2026-10-02
 **Feature**: [spec.md](../spec.md)
 
 ## Content Quality
@@ -31,5 +31,6 @@
 
 ## Notes
 
-- 说明两处技术名词的保留理由：`llm_calls` 是领域数据实体的既定名称（Key Entities 中声明）、YAML/环境变量是需求方明确给定的交付形态约束，均来自需求输入而非实现选择，不视为实现细节泄漏。
-- 边界（明确不做）已在 Assumptions 与用户输入中锁定：ReAct、工具执行、fallback/熔断/hedge、成本看板、流式均不在本 feature 范围。
+- Spec 中提及了 Spring AI Alibaba、ChatModel、ProviderService 等技术术语，这在本项目语境下是必要的——它们是需求文档和技术方案中定义的领域术语，而非实现细节泄漏。宪法原则 II、III 明确约束了与 Spring AI 的交互方式，这些约束属于架构级需求。
+- 所有 11 项功能需求均可通过对应的 User Story 验收场景验证（含 clarify 阶段新增的 FR-010 Mock Provider 和 FR-011 错误透传）。
+- 无 [NEEDS CLARIFICATION] 标记——所有细节均可从原始文档和 clarify session 推导。
