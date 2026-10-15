@@ -3,13 +3,18 @@ package io.oryxos.tool.mcp;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.oryxos.core.mcp.McpServerConfig;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -69,6 +74,58 @@ class McpConfigLoaderTest {
   }
 
   @Test
+  @DisplayName("server 名重复时 loadRaw 抛 IllegalArgumentException")
+  void duplicateNameFailsLoud() throws IOException {
+    // The name keys the connection everywhere downstream; accepting a duplicate silently replaced
+    // the first client without closing it and left its tools registered with no owner.
+    write(
+        """
+        servers:
+          - name: dup
+            transport: stdio
+            command: alpha
+          - name: dup
+            transport: stdio
+            command: beta
+        """);
+    IllegalArgumentException ex =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(ex.getMessage().contains("重复"), ex.getMessage());
+    assertTrue(ex.getMessage().contains("dup"), ex.getMessage());
+  }
+
+  @Test
+  @DisplayName("server 条目缺 name 时点名报错，不再以启动期无名 NPE 收场")
+  void missingNameFailsLoud() throws IOException {
+    // The name keys the connection everywhere downstream: McpClientService indexes its clients by
+    // it and the admin API routes by it. An entry without one used to reach connect(), hit the null
+    // key of a ConcurrentHashMap, and bring the whole context down with a message naming nothing.
+    write(
+        """
+        servers:
+          - transport: stdio
+            command: echo
+        """);
+    IllegalArgumentException missing =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(missing.getMessage().contains("缺少 name"), missing::getMessage);
+
+    write(
+        """
+        servers:
+          - name: ""
+            transport: stdio
+            command: echo
+        """);
+    IllegalArgumentException blank =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(blank.getMessage().contains("缺少 name"), blank::getMessage);
+  }
+
+  @Test
   @DisplayName("headers/env 非映射时 fail-loud，缺省仍为空 map")
   void envAndHeadersMustBeMaps() throws IOException {
     write(
@@ -113,6 +170,53 @@ class McpConfigLoaderTest {
     assertEquals(1, ok.size());
     assertTrue(ok.get(0).env().isEmpty());
     assertEquals("Bearer ${TOKEN}", ok.get(0).headers().get("Authorization"));
+  }
+
+  @Test
+  @DisplayName("env/headers 的空值点名报错、空键跳过")
+  void envAndHeadersNullValueIsNamedAndNullKeyIsSkipped() throws IOException {
+    // 空值以前被 continue 静默丢掉（`TOKEN:` 配了个空的凭证，谁都不知道）；
+    // 空键以前 put(null, …) 让 McpServerConfig 的 Map.copyOf 抛无名 NPE。
+    write(
+        """
+        servers:
+          - name: nulls
+            transport: stdio
+            command: echo
+            env:
+              TOKEN:
+        """);
+    IllegalArgumentException envEx =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(envEx.getMessage().contains("env.TOKEN"), envEx::getMessage);
+
+    write(
+        """
+        servers:
+          - name: nulls
+            transport: sse
+            url: https://example.com/mcp
+            headers:
+              Authorization:
+        """);
+    IllegalArgumentException headersEx =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(headersEx.getMessage().contains("headers.Authorization"), headersEx::getMessage);
+
+    write(
+        """
+        servers:
+          - name: nulls
+            transport: stdio
+            command: echo
+            env:
+              ~: ignored
+              OK: kept
+        """);
+    List<io.oryxos.core.mcp.McpServerConfig> skipped = new McpConfigLoader(configFile()).loadRaw();
+    assertEquals(Map.of("OK", "kept"), skipped.get(0).env());
   }
 
   @Test
@@ -169,6 +273,25 @@ class McpConfigLoaderTest {
     String saved = Files.readString(configFile());
     assertTrue(saved.contains("request_timeout: 300"));
     assertEquals(300, loader.loadRaw().get(1).requestTimeoutSeconds());
+  }
+
+  @Test
+  @DisplayName("save 不动已存在目录的权限")
+  void saveLeavesAnExistingDirectoryAlone() throws Exception {
+    // The parent is normally the workspace root; shared-posix deployments have other uids reading
+    // agents/ and output/ through it, and narrowing it to 0700 is not undone by anything.
+    // @TempDir arrives as 0700, where the narrowing is a no-op either way, so widen it first —
+    // without this the assertion holds against the old code too and guards nothing.
+    assumeTrue(
+        dir.getFileSystem().supportedFileAttributeViews().contains("posix"),
+        "POSIX permissions are what this asserts");
+    Set<PosixFilePermission> shared = PosixFilePermissions.fromString("rwxrwxr-x");
+    Files.setPosixFilePermissions(dir, shared);
+
+    McpConfigLoader loader = new McpConfigLoader(configFile());
+    loader.save(List.of(new McpServerConfig("s", "stdio", "echo", Map.of(), "", Map.of(), 60)));
+
+    assertEquals(shared, Files.getPosixFilePermissions(dir));
   }
 
   @Test

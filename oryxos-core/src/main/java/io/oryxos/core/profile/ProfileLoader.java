@@ -302,7 +302,7 @@ public class ProfileLoader {
   private static void validateCronAndZone(String key, String cron, String zone, String source) {
     ZoneId zoneId;
     try {
-      zoneId = zone == null || zone.isBlank() ? ZoneId.systemDefault() : ZoneId.of(zone);
+      zoneId = Profile.ScheduleConfig.resolveZone(zone);
     } catch (RuntimeException e) {
       throw new ProfileValidationException(
           "Profile 定时配置 " + key + " 的 zone 无效: " + source + " (" + e.getMessage() + ")");
@@ -349,7 +349,9 @@ public class ProfileLoader {
             map.get("max_history_turns"),
             defaults.maxHistoryTurns(),
             "settings.max_history_turns",
-            profileName));
+            profileName),
+        MaxIterationsMode.fromConfig(
+            map.get("max_iterations_mode") instanceof String s ? s : null));
   }
 
   /** 递归解析 ${ENV} 占位；环境变量缺失时保留原样并 WARN（凭证必填校验属全局层职责）。 */

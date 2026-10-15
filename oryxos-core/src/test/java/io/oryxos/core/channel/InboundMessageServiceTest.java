@@ -538,4 +538,74 @@ class InboundMessageServiceTest {
         adapter.sent().stream()
             .anyMatch(s -> InboundMessageService.ASSET_OFFLINE_REPLY.equals(s.text())));
   }
+
+  @Test
+  @DisplayName("提交失败（triggerAsync 抛）：登记必须释放，否则 /stop 会去中断一个不存在的运行")
+  void submitFailureReleasesTheActiveRun() {
+    Session session = new Session("stub:user-1:" + AGENT, AGENT);
+    when(sessionManager.getOrCreate("stub", "user-1", AGENT)).thenReturn(session);
+    // 落执行记录写库失败，或执行器已停机 —— 两种都在真实实现里从 triggerAsync 抛出。
+    when(executionService.triggerAsync(anyString(), anyString(), any(), any()))
+        .thenThrow(new IllegalStateException("执行器已停机"));
+
+    try {
+      service.onMessage(p2p("m-submit-fail", "一个问题"), adapter);
+    } catch (RuntimeException expected) {
+      // 异常是否逸出取决于调用方，与本次要验证的行为无关
+    }
+
+    // 登记若未释放，这一步会回 STOP_REPLY 并去中断那个从未运行的 session：
+    // 中断标志只在 ReActLoop 观察到时才清，没人观察就永久留着，
+    // 而私聊的 sessionId 正是用户的真实会话 —— 下一条正常消息会被误判为已中断。
+    service.onMessage(p2p("m-stop-after-fail", "/stop"), adapter);
+
+    assertEquals(
+        InboundMessageService.STOP_NO_SESSION_REPLY,
+        adapter.sent().get(adapter.sent().size() - 1).text(),
+        "提交失败后不该留下可被 /stop 定位到的登记");
+    verify(interruptManager, never()).interrupt(any());
+  }
+
+  @Test
+  @DisplayName("提交失败时，已经发出去的进度流必须被收尾，不能留一张永久的「思考中」卡片")
+  void submitFailureClosesAnOpenProgressStream() {
+    Session session = new Session("stub:user-1:" + AGENT, AGENT);
+    when(sessionManager.getOrCreate("stub", "user-1", AGENT)).thenReturn(session);
+
+    // 记下这张进度流被怎么处置
+    java.util.List<String> calls =
+        java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    adapter.useProgressStream(
+        new InboundProgressStream() {
+          @Override
+          public void start() {
+            calls.add("start");
+          }
+
+          @Override
+          public void finish(String t) {
+            calls.add("finish");
+          }
+
+          @Override
+          public void fail(String m) {
+            calls.add("fail");
+          }
+
+          @Override
+          public void onToken(String delta) {}
+        });
+
+    // 提交失败：落执行记录写库失败，或执行器已停机
+    when(executionService.triggerAsync(anyString(), anyString(), any(), any()))
+        .thenThrow(new IllegalStateException("执行器已停机"));
+
+    try {
+      service.onMessage(p2p("m-progress-abandon", "一个问题"), adapter);
+    } catch (RuntimeException expected) {
+      // 异常是否逸出与本次要验证的行为无关
+    }
+
+    assertEquals(java.util.List.of("start", "fail"), calls, "start 之后必须有人收尾（fail），否则占位卡片永远停在思考中");
+  }
 }

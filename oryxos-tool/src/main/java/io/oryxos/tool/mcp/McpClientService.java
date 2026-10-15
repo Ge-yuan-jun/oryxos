@@ -41,6 +41,18 @@ public class McpClientService {
   /** 连接探测在启动和管理 API 写路径同步执行，不能继承最长一小时的业务调用超时，否则故障 server 会阻塞整个控制面。 */
   private static final Duration MAX_CONNECT_PROBE_TIMEOUT = Duration.ofSeconds(60);
 
+  /**
+   * How long a status probe waits before a server is called unreachable. Short, because the admin
+   * list polls every server and a hung one must not hold the response.
+   */
+  private static final Duration STATUS_PROBE_TIMEOUT = Duration.ofSeconds(2);
+
+  /**
+   * Polls inside this window reuse the last successful probe, so a healthy server is pinged at most
+   * once per window. A failed probe drops the entry, so a dead one is paid for once.
+   */
+  private static final Duration DEFAULT_STATUS_PROBE_CACHE = Duration.ofSeconds(15);
+
   private static final Set<String> SUPPORTED_TRANSPORTS =
       Set.of(
           McpServerConfig.TRANSPORT_STDIO,
@@ -58,6 +70,14 @@ public class McpClientService {
   private final Map<String, McpSyncClient> activeClients = new ConcurrentHashMap<>();
   private final Map<String, List<String>> registeredTools = new ConcurrentHashMap<>();
   private final Map<String, String> lastErrors = new ConcurrentHashMap<>();
+  // Set by connectAll so the shutdown path can unregister the tools it added; a destroy method
+  // takes no arguments, and leaving them registered would outlive their transport.
+  private volatile ToolRegistry ownRegistry;
+
+  private final Duration statusProbeCache;
+
+  /** Last successful status probe per server, on {@link System#nanoTime()}. */
+  private final Map<String, Long> probeTimestamps = new ConcurrentHashMap<>();
 
   public McpClientService(McpConfigLoader configLoader) {
     this(configLoader, McpClientService::connectDefault);
@@ -65,12 +85,22 @@ public class McpClientService {
 
   public McpClientService(
       McpConfigLoader configLoader, Function<McpServerConfig, McpSyncClient> clientFactory) {
+    this(configLoader, clientFactory, DEFAULT_STATUS_PROBE_CACHE);
+  }
+
+  /** {@code statusProbeCache} of zero makes every status call probe, which tests need. */
+  McpClientService(
+      McpConfigLoader configLoader,
+      Function<McpServerConfig, McpSyncClient> clientFactory,
+      Duration statusProbeCache) {
     this.configLoader = configLoader;
     this.clientFactory = clientFactory;
+    this.statusProbeCache = statusProbeCache;
   }
 
   /** 启动时的全量连接：加载配置逐个 {@link #connect}，单个失败只 WARN 不拖垮其余。 */
   public void connectAll(ToolRegistry registry) {
+    ownRegistry = registry;
     for (McpServerConfig config : configLoader.load()) {
       connect(config, registry);
     }
@@ -128,12 +158,36 @@ public class McpClientService {
 
   /** 断开一个 server：注销它注册过的工具、清空运行时状态。管理台删除/改配置一个 server 时调用。 */
   public void disconnect(String serverName, ToolRegistry registry) {
-    for (String toolName : registeredTools.getOrDefault(serverName, List.of())) {
-      registry.unregister(toolName);
+    if (registry != null) {
+      for (String toolName : registeredTools.getOrDefault(serverName, List.of())) {
+        registry.unregister(toolName);
+      }
     }
     registeredTools.remove(serverName);
+    probeTimestamps.remove(serverName);
     closeQuietly(serverName, activeClients.remove(serverName));
     lastErrors.remove(serverName);
+  }
+
+  /**
+   * Close every open connection. Registered as the bean's destroy method: connections are opened
+   * for any command whose context builds a tool registry, and nothing else releases them — a stdio
+   * server only exits when its client closes the transport.
+   */
+  public void closeAll() {
+    ToolRegistry registry = ownRegistry;
+    for (String serverName : List.copyOf(activeClients.keySet())) {
+      if (registry != null) {
+        for (String toolName : registeredTools.getOrDefault(serverName, List.of())) {
+          registry.unregister(toolName);
+        }
+      }
+      closeQuietly(serverName, activeClients.remove(serverName));
+    }
+    registeredTools.clear();
+    lastErrors.clear();
+    probeTimestamps.clear();
+    ownRegistry = null;
   }
 
   private static void closeQuietly(String serverName, McpSyncClient client) {
@@ -149,11 +203,66 @@ public class McpClientService {
 
   /** 单个 server 的运行时状态：是否连上、给了哪些工具、失败原因。 */
   public McpServerStatus status(String serverName) {
-    if (activeClients.containsKey(serverName)) {
-      return new McpServerStatus(
-          serverName, true, null, registeredTools.getOrDefault(serverName, List.of()));
+    McpSyncClient client = activeClients.get(serverName);
+    if (client == null) {
+      return new McpServerStatus(serverName, false, lastErrors.get(serverName), List.of());
     }
-    return new McpServerStatus(serverName, false, lastErrors.get(serverName), List.of());
+    if (!isReachable(serverName, client)) {
+      // The transport is gone but nothing closed it, so the entry would otherwise keep reporting a
+      // usable server and leave its tools registered. Drop it; the next connect can rebuild.
+      String error = lastErrors.get(serverName);
+      disconnect(serverName, ownRegistry);
+      lastErrors.put(serverName, error);
+      return new McpServerStatus(serverName, false, error, List.of());
+    }
+    return new McpServerStatus(
+        serverName, true, null, registeredTools.getOrDefault(serverName, List.of()));
+  }
+
+  /**
+   * Whether {@code client} answers, cached for the configured window. A server that dies between
+   * calls reported {@code connected} forever; the probe bounds the wait so a hung server costs one
+   * timeout per window rather than one per poll.
+   */
+  private boolean isReachable(String serverName, McpSyncClient client) {
+    long now = System.nanoTime();
+    Long last = probeTimestamps.get(serverName);
+    if (last != null && now - last < statusProbeCache.toNanos()) {
+      return true;
+    }
+    FutureTask<Boolean> probe =
+        new FutureTask<>(
+            () -> {
+              client.ping();
+              return Boolean.TRUE;
+            });
+    Thread.ofVirtual().name("oryxos-mcp-status-probe").start(probe);
+    try {
+      probe.get(STATUS_PROBE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+      probeTimestamps.put(serverName, now);
+      lastErrors.remove(serverName);
+      return true;
+    } catch (TimeoutException e) {
+      probe.cancel(true);
+      lastErrors.put(
+          serverName,
+          "MCP server " + serverName + " 无响应：探测超过 " + STATUS_PROBE_TIMEOUT.toSeconds() + " 秒");
+      return false;
+    } catch (InterruptedException e) {
+      probe.cancel(true);
+      Thread.currentThread().interrupt();
+      lastErrors.put(serverName, "MCP server " + serverName + " 探测被中断");
+      return false;
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      lastErrors.put(
+          serverName,
+          "MCP server "
+              + serverName
+              + " 已断开: "
+              + (cause == null ? e.toString() : cause.toString()));
+      return false;
+    }
   }
 
   static Duration connectProbeTimeout(McpServerConfig config) {

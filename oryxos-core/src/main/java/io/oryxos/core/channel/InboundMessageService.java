@@ -48,6 +48,10 @@ public class InboundMessageService {
   static final String NEW_SESSION_REPLY = "已开启新会话，之前的对话上下文已清空。";
   static final String STOP_REPLY = "已发送停止信号，正在执行的任务将在下一轮停止。";
   static final String STOP_NO_SESSION_REPLY = "当前没有正在执行的任务。";
+
+  /** 集群档专用：本副本没在跑这个会话，但另一个副本可能正在跑 —— 不能回 {@link #STOP_NO_SESSION_REPLY}（那是"没有正在执行的任务"，与事实不符）。 */
+  static final String STOP_ELSEWHERE_REPLY = "本副本没有在跑这个会话的推理；它可能在另一个副本上。";
+
   private static final String NEW_SESSION_COMMAND = "/new";
 
   /** 飞书等可能对同一意图连推多条不同 message_id；短窗内只确认一次。 */
@@ -61,6 +65,10 @@ public class InboundMessageService {
   private final ProfileRegistry profileRegistry;
   private final AgentExecutionService executionService;
   private final MessageDeduplicator deduplicator;
+
+  /** 集群档只读租约查询；默认 NONE（单机档语义不变）。 */
+  private TurnLeaseLookup turnLeaseLookup = TurnLeaseLookup.NONE;
+
   private final InboundMediaEnricher mediaEnricher;
   private final Duration processingNoticeDelay;
   private final InterruptManager interruptManager;
@@ -141,6 +149,14 @@ public class InboundMessageService {
   }
 
   /**
+   * 撤销一次占用，与 {@link #tryClaim} 对称。占用之后若最终没能给出任何答复，必须撤销 —— 否则平台对同一 message_id 的重推会被判为重复而静默丢弃，用户拿到 0
+   * 条回答。
+   */
+  public void releaseClaim(String channelName, String messageId) {
+    deduplicator.release(channelName + DEDUP_KEY_SEPARATOR + messageId);
+  }
+
+  /**
    * 昂贵预处理（如下载图片）开始前立刻发 B8「处理中」（仍受合并窗约束）。下载+识图常在默认阈值（15s）内结束，若仍走延迟计时，用户会感到「识别完 才提示」。返回的 latch
    * 必须在整条入站链路结束时 {@code countDown}，并交给 {@link #onClaimedMessage(InboundMessage,
    * InboundChannelAdapter, CountDownLatch)}，避免推理阶段再开一个提示。
@@ -199,33 +215,52 @@ public class InboundMessageService {
     List<Message.MediaPart> media = InboundMediaParts.from(msg);
     InferenceJob job = buildInference(msg, replyVia, agent, agentInput, media, replyTo);
     String chatKey = ActiveRunRegistry.chatKey(msg.channelType(), msg.chatId());
-    activeRuns.register(chatKey, job.sessionId());
+    // 令牌按本次运行发放：私聊同一用户的 sessionId 恒定，用它做撤销身份会让
+    // 先结束的运行清掉后一次（仍在跑）的登记。
+    long runToken = activeRuns.register(chatKey, job.sessionId());
     CountDownLatch done = preprocessingDone != null ? preprocessingDone : new CountDownLatch(1);
     // B5/B10：推理在虚拟线程后台跑并落 agent_executions（source = 渠道类型）
-    executionService.triggerAsync(
-        agent,
-        msg.channelType(),
-        job.sessionId(),
-        () -> {
-          try {
-            job.inference().run();
-          } catch (io.oryxos.core.cluster.TurnWaitTimeoutException e) {
-            // 026：等待超限单独提示（用户稍候重发即可，不是系统故障）
-            if (!job.streamed()) {
-              safeReply(replyVia, msg.chatId(), TURN_BUSY_REPLY, replyTo);
+    try {
+      executionService.triggerAsync(
+          agent,
+          msg.channelType(),
+          job.sessionId(),
+          () -> {
+            try {
+              job.inference().run();
+            } catch (io.oryxos.core.cluster.TurnWaitTimeoutException e) {
+              // 026：等待超限单独提示（用户稍候重发即可，不是系统故障）
+              if (!job.streamed()) {
+                safeReply(replyVia, msg.chatId(), TURN_BUSY_REPLY, replyTo);
+              }
+              throw e;
+            } catch (RuntimeException e) {
+              // B6：失败以可读消息告知用户（不含堆栈），异常继续上抛让执行记录记为失败
+              if (!job.streamed()) {
+                safeReply(replyVia, msg.chatId(), FAILURE_REPLY, replyTo);
+              }
+              throw e;
+            } finally {
+              activeRuns.unregister(chatKey, runToken);
+              done.countDown();
             }
-            throw e;
-          } catch (RuntimeException e) {
-            // B6：失败以可读消息告知用户（不含堆栈），异常继续上抛让执行记录记为失败
-            if (!job.streamed()) {
-              safeReply(replyVia, msg.chatId(), FAILURE_REPLY, replyTo);
-            }
-            throw e;
-          } finally {
-            activeRuns.unregister(chatKey, job.sessionId());
-            done.countDown();
-          }
-        });
+          });
+    } catch (RuntimeException e) {
+      // 提交失败（落执行记录写库失败、执行器已停机等）时那段 Runnable 从未运行，
+      // 它的 finally 也就不会执行。留着登记会让 /stop 定位到一个不存在的运行：
+      // 中断标志只在 ReActLoop 观察到时才清，没人观察就永久留在 InterruptedSessions，
+      // 而私聊的 sessionId 正是用户的真实会话 —— 下一条正常消息会被误判为已中断。
+      activeRuns.unregister(chatKey, runToken);
+      done.countDown();
+      // 进度流已经发过「思考中」占位，而 finish/fail 都写在没跑起来的那段 Runnable 里 ——
+      // 不在这里收尾，用户看到的就是一张永远停在思考中的卡片。
+      job.abandon().run();
+      // 与上面 activeRuns.unregister 同理：去重登记也要撤。不撤的话，平台按自己的策略
+      // 重推同一 message_id 会命中判重而被静默丢弃，用户永远拿不到回答 —— 而这次失败
+      // 根本没走到「可能有部分答复」的地步，撤销不会造成重复。
+      releaseClaim(msg.channelName(), msg.messageId());
+      throw e;
+    }
     // 进度流已发「思考中」卡片时不再发延迟「处理中」文本，避免双提示
     if (preprocessingDone == null && !job.streamed()) {
       scheduleProcessingNotice(done, replyVia, msg.chatId(), replyTo);
@@ -291,6 +326,15 @@ public class InboundMessageService {
     return false;
   }
 
+  /**
+   * 接线只读的租约查询（集群档）。默认 {@link TurnLeaseLookup#NONE}，即单机档行为不变。
+   *
+   * <p>用 setter 而非构造参数是为了不动既有构造点；若要更严的依赖表达，改成构造注入亦可。
+   */
+  public void setTurnLeaseLookup(TurnLeaseLookup lookup) {
+    this.turnLeaseLookup = lookup == null ? TurnLeaseLookup.NONE : lookup;
+  }
+
   private void handleStopCommand(
       InboundMessage msg, InboundChannelAdapter replyVia, String replyTo) {
     if (interruptManager == null) {
@@ -300,7 +344,15 @@ public class InboundMessageService {
     String chatKey = ActiveRunRegistry.chatKey(msg.channelType(), msg.chatId());
     String sessionId = activeRuns.current(chatKey).orElse(null);
     if (sessionId == null) {
-      safeReply(replyVia, msg.chatId(), STOP_NO_SESSION_REPLY, replyTo);
+      // 本地登记为空不等于"没有在跑"：集群档下推理可能在另一个副本上（平台随机投一型渠道）。
+      // 只读地问一次会话 id，再问一次租约；两问都成立才改回话 —— 都是只读，不改任何状态。
+      String elsewhere =
+          sessionManager
+              .findSessionId(msg.channelType(), msg.userId(), replyVia.boundAgent())
+              .filter(turnLeaseLookup::heldByAnotherReplica)
+              .map(id -> STOP_ELSEWHERE_REPLY)
+              .orElse(STOP_NO_SESSION_REPLY);
+      safeReply(replyVia, msg.chatId(), elsewhere, replyTo);
       return;
     }
     interruptManager.interrupt(sessionId);
@@ -375,7 +427,10 @@ public class InboundMessageService {
     var streamOpt = replyVia.openProgressStream(chatId, replyTo);
     if (streamOpt.isEmpty()) {
       return new InferenceJob(
-          sessionId, () -> replyVia.sendReply(chatId, plainInference.get(), replyTo), false);
+          sessionId,
+          () -> replyVia.sendReply(chatId, plainInference.get(), replyTo),
+          false,
+          () -> {});
     }
     InboundProgressStream stream = streamOpt.get();
     try {
@@ -383,7 +438,10 @@ public class InboundMessageService {
     } catch (RuntimeException e) {
       LOG.warn("渠道 {} 进度流启动失败，降级整段回复: {}", sanitize(replyVia.name()), sanitize(e.getMessage()));
       return new InferenceJob(
-          sessionId, () -> replyVia.sendReply(chatId, plainInference.get(), replyTo), false);
+          sessionId,
+          () -> replyVia.sendReply(chatId, plainInference.get(), replyTo),
+          false,
+          () -> {});
     }
     return new InferenceJob(
         sessionId,
@@ -408,7 +466,16 @@ public class InboundMessageService {
             throw e;
           }
         },
-        true);
+        true,
+        () -> {
+          // 提交失败时那段 Runnable 从未运行，finish/fail 都不会被调到，
+          // 而「思考中」占位已经发出去了 —— 在这里把它标成失败态。
+          try {
+            stream.fail(FAILURE_REPLY);
+          } catch (RuntimeException ignored) {
+            // 已经发不出去就只留终态，不再上抛
+          }
+        });
   }
 
   private static void release(CountDownLatch latch) {
@@ -417,7 +484,14 @@ public class InboundMessageService {
     }
   }
 
-  private record InferenceJob(String sessionId, Runnable inference, boolean streamed) {}
+  /**
+   * 一次推理的编排句柄。
+   *
+   * @param abandon 提交失败时如何收尾。进度流的生命周期是 start → finish/fail；提交失败意味着那段 Runnable 从未运行，finish/fail
+   *     都不会被调到，而占位消息（飞书卡片等）已经发出去了 —— 必须在这里把它标成失败态，否则用户看到的是一张永远停在「思考中」的卡片。
+   */
+  private record InferenceJob(
+      String sessionId, Runnable inference, boolean streamed, Runnable abandon) {}
 
   static boolean isNewSessionCommand(String agentInput) {
     return agentInput != null && NEW_SESSION_COMMAND.equals(agentInput.strip());

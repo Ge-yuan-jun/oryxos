@@ -7,9 +7,11 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
@@ -83,21 +85,36 @@ public class McpConfigLoader {
       throw new IllegalArgumentException("mcp_servers.yaml 顶层 servers 必须是列表");
     }
     List<McpServerConfig> configs = new ArrayList<>();
+    Set<String> seen = new HashSet<>();
     for (Object item : (List<Object>) servers) {
       if (!(item instanceof Map)) {
         throw new IllegalArgumentException(
             "mcp_servers.yaml 存在非对象条目: " + sanitize(String.valueOf(item)));
       }
       Map<String, Object> entry = (Map<String, Object>) item;
-      configs.add(
+      // 先于构造校验：name 是下游的连接身份键（McpClientService 用它索引客户端，管理台用它路由）。
+      // 缺 name 的条目以前一路放行到 connect()，最后在 ConcurrentHashMap 上撞 null 键抛无名 NPE，
+      // 整个进程起不来且没人知道该改哪一行——与 ChannelConfig.validateShape 同口径点名报错。
+      String name = asString(entry.get("name"));
+      if (name == null || name.isBlank()) {
+        throw new IllegalArgumentException("mcp_servers.yaml server 条目缺少 name");
+      }
+      McpServerConfig config =
           new McpServerConfig(
-              asString(entry.get("name")),
+              name,
               asString(entry.get("transport")),
               asString(entry.get("command")),
               asStringMap(entry.get("env"), "env"),
               asString(entry.get("url")),
               asStringMap(entry.get("headers"), "headers"),
-              asRequestTimeoutSeconds(entry.get(FIELD_REQUEST_TIMEOUT))));
+              asRequestTimeoutSeconds(entry.get(FIELD_REQUEST_TIMEOUT)));
+      // The name is the connection's identity everywhere downstream: McpClientService keys its
+      // clients by it, and the admin API refuses duplicates. Accepting one here silently replaced
+      // the earlier connection without closing it, and orphaned its tools.
+      if (!seen.add(config.name())) {
+        throw new IllegalArgumentException("mcp_servers.yaml server 名重复: " + config.name());
+      }
+      configs.add(config);
     }
     return configs;
   }
@@ -134,8 +151,14 @@ public class McpConfigLoader {
     try {
       Path parent = configFile.getParent();
       if (parent != null) {
+        // Only tighten a directory this call creates. The parent is normally the workspace root,
+        // which other uids may share (shared-posix), and narrowing it to 0700 would cut them off
+        // from agents, knowledge and output — a change that never gets undone.
+        boolean created = !Files.exists(parent);
         Files.createDirectories(parent);
-        restrictToOwner(parent);
+        if (created) {
+          restrictToOwner(parent);
+        }
       }
       Files.writeString(configFile, yaml);
       restrictToOwner(configFile); // env/headers 里可能落了真实凭证（占位符解析不了时）——只给属主可读写
@@ -177,8 +200,15 @@ public class McpConfigLoader {
     }
     Map<String, String> out = new LinkedHashMap<>();
     for (Map.Entry<String, Object> entry : ((Map<String, Object>) value).entrySet()) {
-      if (entry.getValue() == null) {
+      if (entry.getKey() == null) {
+        // `~:` / 空键：这项没有名字可绑，跳过（与 ChannelConfigLoader.asExtra 同口径）。
         continue;
+      }
+      if (entry.getValue() == null) {
+        // 空值（`TOKEN:` / `TOKEN: ~`）不是字符串：以前这里 continue 会把它静默丢掉，
+        // 而键为 null 时 out.put(null, …) 又让后面的 Map.copyOf 抛无名 NPE。
+        throw new IllegalArgumentException(
+            "mcp_servers.yaml 的 " + field + "." + entry.getKey() + " 不能为空（空值请写 \"\" 或删除该行）");
       }
       out.put(entry.getKey(), asString(entry.getValue()));
     }

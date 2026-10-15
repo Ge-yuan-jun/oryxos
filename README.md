@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/oryx-labs/oryxos/releases"><img src="https://img.shields.io/badge/version-0.1.6-orange?style=flat-square" alt="version"/></a>
+  <a href="https://github.com/oryx-labs/oryxos/releases"><img src="https://img.shields.io/badge/version-0.1.7-orange?style=flat-square" alt="version"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-native-8A2BE2?style=flat-square" alt="MCP native"/></a>
   <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="Apache 2.0"/></a>
 </p>
@@ -116,12 +116,32 @@ Define an agent in one sentence or one directory; it goes live with no restart. 
 ```text
 oryxos/
 ├── oryxos-core          # OryxTool, Session, ReActLoop, PromptBuilder, ToolExecutor, AgentScheduler
+├── oryxos-persona       # Persona preset catalog (12 built-in) + user-defined persona CRUD
 ├── oryxos-provider      # ProviderService, Function Calling adapter, explicit multi-provider map
 ├── oryxos-memory        # MemoryService, LongTermMemory, MemoryTools (save/recall)
 ├── oryxos-knowledge     # Knowledge base: local backend plugin, chunk/embed/index pipeline,
 │                        #   hybrid retrieval (vector + keyword + RRF), retrieve_knowledge
 ├── oryxos-tool          # Built-in tools (file/shell/http), MCP Client, ToolRegistry, SandboxChecker
-├── oryxos-channel-cli   # CLI channel: oryxos chat implementation
+├── channels/            # Channel adapters, grouped under the oryxos-channels aggregator
+│   ├── oryxos-channel-cli   # CLI channel: oryxos chat implementation
+│   ├── oryxos-channel-feishu  # Feishu inbound channel (long connection)
+│   ├── oryxos-channel-wecom  # WeCom smart-bot inbound channel
+│   ├── oryxos-channel-dingtalk  # DingTalk stream inbound channel
+│   ├── oryxos-channel-slack  # Slack inbound channel (Socket Mode)
+│   ├── oryxos-channel-discord  # Discord inbound channel (Gateway)
+│   ├── oryxos-channel-telegram  # Telegram bot inbound channel
+│   ├── oryxos-channel-whatsapp  # WhatsApp inbound channel
+│   ├── oryxos-channel-teams  # Microsoft Teams inbound channel
+│   ├── oryxos-channel-gchat  # Google Chat inbound channel
+│   ├── oryxos-channel-mattermost  # Mattermost inbound channel
+│   ├── oryxos-channel-matrix  # Matrix inbound channel
+│   ├── oryxos-channel-qq  # QQ official bot inbound channel
+│   ├── oryxos-channel-douyin  # Douyin OpenAPI inbound channel
+│   ├── oryxos-channel-weixin  # WeChat iLink bot inbound channel
+│   ├── oryxos-channel-weixin-kf  # WeChat Customer Service inbound channel
+│   ├── oryxos-channel-weixin-mp  # WeChat Official Account inbound channel
+│   ├── oryxos-channel-weixin-mini  # WeChat Mini Program inbound channel
+│   └── oryxos-channel-alipay  # Alipay lifestyle inbound channel
 ├── oryxos-web           # REST API controllers, Web admin console, GlobalExceptionHandler
 ├── oryxos-storage       # SQLite, SessionRepository, ToolInvocationRepository, LlmCallRepository
 ├── oryxos-cli           # Picocli entry, 12 subcommands, ConfigLoader
@@ -133,6 +153,15 @@ Modules are decoupled through interfaces. Adding a new Channel or Tool requires 
 ## Quick Start
 
 **Prerequisites**: Java 21, Maven 3.9+, and an LLM API key (DeepSeek / Qwen / OpenAI / Ollama). The Maven build installs a local Node.js on first run to bundle the admin UI — no global Node.js required.
+
+**Quickest setup — [SDKMAN!](https://sdkman.io/)** (recommended): the repo ships a `.sdkmanrc` that pins the exact JDK and Maven versions. After installing SDKMAN, enable `sdkman_auto_env=true` in `~/.sdkman/etc/config`, then:
+
+```bash
+cd oryxos
+sdk env install    # installs the JDK + Maven versions declared in .sdkmanrc
+```
+
+From then on, every `cd` into the project directory auto-switches to the right toolchain. If you prefer to install Java and Maven yourself (e.g. via `apt`, `brew`, or a tarball), make sure `java -version` reports 21+ and `mvn -version` reports 3.9+.
 
 **Windows**: Built-in workspace storage requires a native POSIX filesystem, so start the server inside WSL2 (Ubuntu). Clone into the Linux home directory, for example `~/oryxos`, then build and run there. A checkout on a Windows drive such as `/mnt/d/...` is still NTFS and fails the same startup check. Docker on WSL2 is the other supported path.
 
@@ -244,6 +273,7 @@ schedules:
   - key: daily-brief
     name: Daily brief
     cron: "0 0 9 * * *"
+    zone: Asia/Shanghai
 settings:
   max_iterations: 10
   max_history_turns: 20
@@ -251,6 +281,8 @@ settings:
 
 You are a professional DevOps assistant. When triggered, ... (task instructions)
 ```
+
+Schedules with an omitted or blank `zone` use UTC, consistently across replicas. To keep a local-time schedule when upgrading from the previous system-time-zone default, set `zone` explicitly to the deployment's former time zone. For example, a daily `09:00` schedule without `zone` now runs at `17:00` in Shanghai; set `zone: Asia/Shanghai` to keep `09:00` Shanghai time.
 
 In single-node mode, `WorkspaceWatcher` registers workspace changes without restarting. In cluster mode, use the management API; direct file changes require a stopped-writer maintenance window and are picked up by periodic reconciliation. Agents can also be created via `POST /api/v1/agents` or drafted from one sentence via the admin console.
 

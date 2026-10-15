@@ -1005,7 +1005,7 @@ public class OryxOsRuntime {
   }
 
   /** 31 节：长驻 bean（而非 toolRegistry() 里的一次性局部变量）——管理台增/删一个 server 靠同一个实例的连接状态。 */
-  @Bean
+  @Bean(destroyMethod = "closeAll")
   McpClientService mcpClientService(McpConfigLoader mcpConfigLoader) {
     return new McpClientService(mcpConfigLoader);
   }
@@ -1881,6 +1881,8 @@ public class OryxOsRuntime {
               coordinationStore, clusterProps, taskScheduler);
       leaseCoordinator.setMetricsRecorder(channelMetricsRecorder);
       service.setChannelLeaseCoordinator(leaseCoordinator);
+      // 集群档要求渠道配好调用方校验：多副本生产里，裸奔的入站端点谁都能驱动 Agent 推理（#918）
+      service.setRequireCallerVerification(true);
     }
     return service;
   }
@@ -2179,11 +2181,13 @@ public class OryxOsRuntime {
   AgentExecutionService agentExecutionService(
       AgentExecutionStore agentExecutionStore,
       @Qualifier("agentExecutionExecutor") ExecutorService agentExecutionExecutor,
-      AgentRunEventPublisher agentRunEventPublisher) {
+      AgentRunEventPublisher agentRunEventPublisher,
+      io.oryxos.core.cluster.ClusterProperties clusterProperties) {
     return new AgentExecutionService(
         agentExecutionStore,
         agentExecutionExecutor,
         Clock.systemDefaultZone(),
-        agentRunEventPublisher);
+        agentRunEventPublisher,
+        clusterProperties.isEnabled());
   }
 }

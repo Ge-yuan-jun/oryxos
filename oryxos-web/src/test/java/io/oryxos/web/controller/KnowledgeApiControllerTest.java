@@ -1,7 +1,9 @@
 package io.oryxos.web.controller;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
@@ -136,6 +138,100 @@ class KnowledgeApiControllerTest {
     mvc.perform(get("/api/v1/knowledge/ops-manual/status"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.data[0].state").value("READY"));
+  }
+
+  @Test
+  @DisplayName("描述含 YAML 元字符：建库与改描述都不得把清单写坏（冒号+空格、井号）")
+  void descriptionWithYamlMetacharactersKeepsTheBaseReadable() throws Exception {
+    String description = "产品 FAQ: 价格与退换货 #1";
+
+    createBase("faq", description);
+    mvc.perform(get("/api/v1/knowledge"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data[0].name").value("faq"))
+        .andExpect(jsonPath("$.data[0].description").value(description));
+
+    mvc.perform(
+            patch("/api/v1/knowledge/faq")
+                .contentType("application/json")
+                .content("{\"description\":\"运维手册: 磁盘告警\"}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.description").value("运维手册: 磁盘告警"));
+
+    // 写坏的清单会让库从详情/删除里一起消失——这三步是"库还活着"的最小证明
+    mvc.perform(get("/api/v1/knowledge/faq")).andExpect(status().isOk());
+    mvc.perform(delete("/api/v1/knowledge/faq")).andExpect(status().isOk());
+  }
+
+  @Test
+  @DisplayName("上传保留文件名 KNOWLEDGE.md → 400，库清单原样保留（大小写不敏感）")
+  void uploadRejectsTheManifestFileName() throws Exception {
+    createBase("ops-manual", "运维手册");
+    Path manifest = kbRoot.resolve("ops-manual/KNOWLEDGE.md");
+    String before = Files.readString(manifest);
+
+    // 大小写不敏感：macOS / Windows 上 knowledge.md 指向同一个文件
+    for (String reserved : List.of("KNOWLEDGE.md", "knowledge.md", "Knowledge.MD")) {
+      mvc.perform(
+              multipart("/api/v1/knowledge/ops-manual/documents")
+                  .file(
+                      new MockMultipartFile(
+                          "file", reserved, "text/markdown", "# 我的笔记\n\n这不是清单。".getBytes())))
+          .andExpect(status().isBadRequest())
+          .andExpect(jsonPath("$.message").value(containsString("KNOWLEDGE.md")));
+    }
+
+    assertEquals(before, Files.readString(manifest), "被拒的上传不得改动库清单");
+    // 库仍然可读、可删——这正是被顶掉清单时做不到的两件事
+    mvc.perform(get("/api/v1/knowledge/ops-manual")).andExpect(status().isOk());
+  }
+
+  @Test
+  @DisplayName("删文档接口同样拒收 KNOWLEDGE.md → 400，清单不被删除")
+  void deleteDocumentRejectsTheManifestFileName() throws Exception {
+    createBase("ops-manual", "运维手册");
+    Path manifest = kbRoot.resolve("ops-manual/KNOWLEDGE.md");
+
+    for (String reserved : List.of("KNOWLEDGE.md", "knowledge.md")) {
+      mvc.perform(delete("/api/v1/knowledge/ops-manual/documents").param("path", reserved))
+          .andExpect(status().isBadRequest())
+          .andExpect(jsonPath("$.message").value(containsString("KNOWLEDGE.md")));
+    }
+
+    assertTrue(Files.exists(manifest), "被拒的删除不得移除库清单");
+    mvc.perform(get("/api/v1/knowledge/ops-manual")).andExpect(status().isOk());
+  }
+
+  @Test
+  @DisplayName("path 是根路径（没有文件名）→ 走越界校验拒绝，不解引用 null")
+  void deleteDocumentWithAPathThatHasNoFileName() throws Exception {
+    createBase("ops-manual", "运维手册");
+
+    // Path.of("/").getFileName() == null；这里必须由越界校验给出可读的 400，而不是 NPE
+    mvc.perform(delete("/api/v1/knowledge/ops-manual/documents").param("path", "/"))
+        .andExpect(status().isBadRequest());
+
+    // 清单没被动过
+    mvc.perform(get("/api/v1/knowledge/ops-manual")).andExpect(status().isOk());
+  }
+
+  @Test
+  @DisplayName("反向：名字里带 knowledge 的正常文档照常上传与删除（校验不过度拦截）")
+  void ordinaryDocumentNamesStillWork() throws Exception {
+    createBase("ops-manual", "运维手册");
+
+    // 名字里都带 knowledge，但扩展名合法、且不等于清单名 —— 都不该被拦。
+    // 注意不能用 knowledge.md.bak 这类：扩展名不受支持，400 是导入层的既有行为，与本校验无关。
+    for (String name : List.of("my-knowledge.md", "KNOWLEDGE-notes.md", "knowledge_hub.txt")) {
+      mvc.perform(
+              multipart("/api/v1/knowledge/ops-manual/documents")
+                  .file(new MockMultipartFile("file", name, "text/markdown", "# 内容".getBytes())))
+          .andExpect(status().isOk());
+      mvc.perform(delete("/api/v1/knowledge/ops-manual/documents").param("path", name))
+          .andExpect(status().isOk());
+    }
+
+    mvc.perform(get("/api/v1/knowledge/ops-manual")).andExpect(status().isOk());
   }
 
   @Test
