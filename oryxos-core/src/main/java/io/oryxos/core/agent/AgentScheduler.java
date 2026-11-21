@@ -8,7 +8,6 @@ import io.oryxos.core.profile.ProfileRegistry;
 import io.oryxos.core.session.Session;
 import io.oryxos.core.session.SessionManager;
 import java.time.Instant;
-import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -150,7 +149,8 @@ public class AgentScheduler {
         // 026 A1：包装 Trigger 记录理论触发时刻（scheduled execution time）——各副本对同一 cron
         // 必然算出同值，作为到点认领的 CAS 值；绝不能用执行时墙钟（各副本不同值会双发）
         FireTimeTrigger trigger =
-            new FireTimeTrigger(new CronTrigger(schedule.cron(), resolveZone(schedule.zone())));
+            new FireTimeTrigger(
+                new CronTrigger(schedule.cron(), ScheduleConfig.resolveZone(schedule.zone())));
         String scheduleId =
             taskStore.reconcile(
                 profile.name(),
@@ -317,7 +317,7 @@ public class AgentScheduler {
         }
         metricsRecorder.recordLeaseAcquired("schedule"); // 027 补 026 遗留埋点：到点认领赢者
       }
-      executeLocked(profile, schedule, scheduleId);
+      executeLocked(profile, schedule, scheduleId, fireTime);
     } finally {
       lock.unlock();
     }
@@ -340,7 +340,8 @@ public class AgentScheduler {
             sanitizeLogValue(scheduleId));
         return;
       }
-      executeLocked(profile, schedule, scheduleId);
+      // 这条路径没有到点（手动/补跑），execution 的 fire_time 记 null。
+      executeLocked(profile, schedule, scheduleId, null);
     } finally {
       lock.unlock();
     }
@@ -349,17 +350,20 @@ public class AgentScheduler {
   @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(
       value = "CRLF_INJECTION_LOGS",
       justification = "The scheduleId is stripped of CR and LF before logging.")
-  private void executeLocked(Profile profile, ScheduleConfig schedule, String scheduleId) {
+  private void executeLocked(
+      Profile profile, ScheduleConfig schedule, String scheduleId, Instant fireTime) {
     Instant startedAt = Instant.now();
     long start = System.currentTimeMillis();
     String sessionId = null;
     boolean success = false;
     String error = null;
     long agentExecutionId = startAgentExecution(profile, startedAt, schedule.message());
-    if (agentExecutionService != null && agentExecutionId >= 0) {
-      agentExecutionService.attachScheduledRun(agentExecutionId, profile.name(), "schedule");
-    }
     try {
+      if (agentExecutionService != null && agentExecutionId >= 0) {
+        // 必须留在 try 内：attach 里有 DB 写（markRunning），失败时由 finally 的
+        // completeScheduledRun 收口，否则这条 Run 会永远停在"运行中"且线程登记残留。
+        agentExecutionService.attachScheduledRun(agentExecutionId, profile.name(), "schedule");
+      }
       if (agentExecutionId > 0) {
         ExecutionContext.set(agentExecutionId); // 026：租约行关联 execution（悬空轮留痕）
       }
@@ -381,7 +385,7 @@ public class AgentScheduler {
       LOG.error("Schedule {} failed", sanitizeLogValue(scheduleId), exception);
     } finally {
       ExecutionContext.clear();
-      recordExecution(schedule, scheduleId, sessionId, startedAt, success, error, start);
+      recordExecution(schedule, scheduleId, sessionId, startedAt, fireTime, success, error, start);
       if (agentExecutionService != null && agentExecutionId >= 0) {
         agentExecutionService.completeScheduledRun(agentExecutionId, sessionId, success, error);
       } else {
@@ -446,6 +450,7 @@ public class AgentScheduler {
       String scheduleId,
       String sessionId,
       Instant startedAt,
+      Instant fireTime,
       boolean success,
       String error,
       long start) {
@@ -454,6 +459,7 @@ public class AgentScheduler {
           scheduleId,
           sessionId,
           startedAt,
+          fireTime,
           success,
           error,
           System.currentTimeMillis() - start,
@@ -484,7 +490,8 @@ public class AgentScheduler {
 
   private Instant nextExecution(ScheduleConfig schedule) {
     try {
-      CronTrigger trigger = new CronTrigger(schedule.cron(), resolveZone(schedule.zone()));
+      CronTrigger trigger =
+          new CronTrigger(schedule.cron(), ScheduleConfig.resolveZone(schedule.zone()));
       return trigger.nextExecution(new SimpleTriggerContext());
     } catch (RuntimeException exception) {
       return null;
@@ -494,10 +501,6 @@ public class AgentScheduler {
   /** Returns the in-process overlap lock associated with one globally unique scheduleId. */
   public Lock lockFor(String scheduleId) {
     return taskLocks.computeIfAbsent(scheduleId, ignored -> new ReentrantLock());
-  }
-
-  private ZoneId resolveZone(String zone) {
-    return zone == null || zone.isBlank() ? ZoneId.systemDefault() : ZoneId.of(zone);
   }
 
   static String sanitizeLogValue(String value) {

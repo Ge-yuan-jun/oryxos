@@ -3,8 +3,14 @@ package io.oryxos.core.cost;
 import io.oryxos.core.agent.TraceContext;
 import io.oryxos.core.provider.Usage;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -49,6 +55,7 @@ public final class CostLedgerService {
     if (!properties.isEnabled()) {
       return null;
     }
+    // 成本非负：provider 侧已在 computeMicros 夹平，这里再夹一次是防御（直接调本方法的路径仍可能传负数）。
     long llm = costMicros == null ? 0L : Math.max(0L, costMicros);
     return store.append(
         baseEntry(
@@ -98,11 +105,18 @@ public final class CostLedgerService {
     long latency = 0;
     long prompt = 0;
     long completion = 0;
+    long llmCalls = 0;
+    long toolCalls = 0;
     LinkedHashSet<Long> versions = new LinkedHashSet<>();
     for (CostLedgerEntry e : entries) {
       llm += e.llmCostMicros();
       tool += e.toolCostMicros();
       latency += e.latencyMs();
+      if (e.sourceKind() == CostSourceKind.LLM) {
+        llmCalls++;
+      } else if (e.sourceKind() == CostSourceKind.TOOL) {
+        toolCalls++;
+      }
       if (e.promptTokens() != null) {
         prompt += e.promptTokens();
       }
@@ -121,7 +135,96 @@ public final class CostLedgerService {
         latency,
         prompt,
         completion,
-        List.copyOf(versions));
+        List.copyOf(versions),
+        llmCalls,
+        toolCalls);
+  }
+
+  /** 最大日期跨度（053 趋势图保护）。 */
+  public static final int MAX_DAILY_RANGE_DAYS = 92;
+
+  /**
+   * 按天 LLM 成本序列（053 趋势）；服务端本地时区分天、范围内补零。query 的 from/to 必填，跨度 ≤ {@link #MAX_DAILY_RANGE_DAYS}
+   * 天。未开启返回空。
+   */
+  public List<DailyCostPoint> dailyLlmCost(CostAttributionQuery query) {
+    if (!properties.isEnabled()) {
+      return List.of();
+    }
+    if (query == null || query.from() == null || query.to() == null) {
+      throw new IllegalArgumentException("按天趋势需要 from 与 to 时间参数");
+    }
+    if (!query.to().isAfter(query.from())) {
+      throw new IllegalArgumentException("to 必须晚于 from");
+    }
+    ZoneId zone = ZoneId.systemDefault();
+    LocalDate startDay = query.from().atZone(zone).toLocalDate();
+    LocalDate endDay = query.to().minusMillis(1).atZone(zone).toLocalDate();
+    long days = ChronoUnit.DAYS.between(startDay, endDay) + 1;
+    if (days > MAX_DAILY_RANGE_DAYS) {
+      throw new IllegalArgumentException("日期范围不能超过 " + MAX_DAILY_RANGE_DAYS + " 天");
+    }
+    Map<LocalDate, Long> sums = new HashMap<>();
+    for (CostLedgerEntry e : store.find(query)) {
+      if (e.sourceKind() != CostSourceKind.LLM || e.createdAt() == null) {
+        continue;
+      }
+      LocalDate day = e.createdAt().atZone(zone).toLocalDate();
+      sums.merge(day, e.llmCostMicros(), Long::sum);
+    }
+    List<DailyCostPoint> out = new ArrayList<>();
+    for (LocalDate d = startDay; !d.isAfter(endDay); d = d.plusDays(1)) {
+      out.add(new DailyCostPoint(d.toString(), sums.getOrDefault(d, 0L)));
+    }
+    return out;
+  }
+
+  /**
+   * 工具调用归集（053）：按 agent 统计工具调用次数（sourceKind=TOOL）；{@code byTool=true}
+   * 时再按工具名细分。按次数降序、agent/工具名稳定排序。未开启返回空。
+   */
+  public List<ToolUsageEntry> toolUsage(CostAttributionQuery query, boolean byTool) {
+    if (!properties.isEnabled()) {
+      return List.of();
+    }
+    Map<String, Long> counts = new HashMap<>();
+    Map<String, String[]> meta = new HashMap<>();
+    for (CostLedgerEntry e : store.find(query)) {
+      if (e.sourceKind() != CostSourceKind.TOOL) {
+        continue;
+      }
+      String agent = e.agentName() == null ? "" : e.agentName();
+      String tool = byTool ? (e.sourceRef() == null ? "" : e.sourceRef()) : null;
+      String key = agent + "\u0000" + (tool == null ? "" : tool);
+      counts.merge(key, 1L, Long::sum);
+      meta.putIfAbsent(key, new String[] {agent, tool});
+    }
+    return counts.entrySet().stream()
+        .map(
+            en ->
+                new ToolUsageEntry(
+                    meta.get(en.getKey())[0], meta.get(en.getKey())[1], en.getValue()))
+        .sorted(
+            (a, b) -> {
+              int c = Long.compare(b.callCount(), a.callCount());
+              if (c != 0) {
+                return c;
+              }
+              c = a.agentName().compareTo(b.agentName());
+              if (c != 0) {
+                return c;
+              }
+              return String.valueOf(a.tool()).compareTo(String.valueOf(b.tool()));
+            })
+        .toList();
+  }
+
+  /** 筛选器候选值（053）；未开启返回空。 */
+  public CostFacets facets() {
+    if (!properties.isEnabled()) {
+      return CostFacets.empty();
+    }
+    return store.facets();
   }
 
   public BudgetDecision checkBudget(String agentName, String teamId, String model, String runId) {
@@ -168,10 +271,20 @@ public final class CostLedgerService {
     long ledgerTool = store.sumToolCostMicros(q);
     long audit = auditCosts.sumCostMicrosByTraceId(id);
     boolean matched = ledgerLlm == audit;
-    String detail =
-        matched
-            ? "ledger llm matches audit llm_calls"
-            : "mismatch ledgerLlm=" + ledgerLlm + " auditLlm=" + audit;
+    String detail;
+    if (matched) {
+      detail = "ledger llm matches audit llm_calls";
+    } else {
+      detail = "mismatch ledgerLlm=" + ledgerLlm + " auditLlm=" + audit;
+      if (audit < 0) {
+        // 负审计合计只可能来自夹平之前写入的行（负单价）或直接改库；账本对这类行记 0。
+        // 不写清楚的话，这条 mismatch 看起来像丢账，而实际是两个口径对同一个错配置的不同处理。
+        detail +=
+            "; audit total is negative (llm_calls holds a negative cost row: a negative unit price"
+                + " stored before prices were validated/clamped, or edited directly). The ledger"
+                + " floors such rows at 0, so the two totals differ by exactly that amount.";
+      }
+    }
     return new CostReconcileResult(id, ledgerLlm, ledgerTool, audit, matched, detail);
   }
 
@@ -245,6 +358,6 @@ public final class CostLedgerService {
   }
 
   private static CostAttributionSummary emptySummary() {
-    return new CostAttributionSummary(List.of(), 0, 0, 0, 0, 0, 0, List.of());
+    return new CostAttributionSummary(List.of(), 0, 0, 0, 0, 0, 0, List.of(), 0, 0);
   }
 }

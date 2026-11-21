@@ -24,8 +24,10 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import org.slf4j.Logger;
@@ -139,26 +141,52 @@ public class SpringAiProviderServiceImpl implements ProviderService {
       value = "CRLF_INJECTION_LOGS",
       justification = "日志中的 provider 名已经 sanitize() 消去 CR/LF；taint 分析不跨方法追踪该消毒，故局部抑制")
   public ProviderResponse chat(String sessionId, Profile profile, ProviderRequest request) {
+    long callStartedAt = System.currentTimeMillis();
     List<Attempt> attempts = resolveAttempts(profile);
     RuntimeException last = null;
     for (int i = 0; i < attempts.size(); i++) {
       Attempt attempt = attempts.get(i);
-      ProviderDef def = findDef(attempt, i == 0);
+      ProviderDef def;
+      try {
+        def = findDef(attempt, isDeclaredPrimary(profile, attempt));
+      } catch (ProviderNotFoundException e) {
+        // 声明主未注册：点名报错不换家（PNFE 契约），但失败必须留痕——这个抛出在下面的 fallback try
+        // 之外，不补记则审计、失败指标与 LLM span 一起为零（宪法 V）。与预算拒绝同口径（见下）：真实
+        // 调用没有发生，durationMs 只含到此为止的检查耗时。
+        recordFailure(sessionId, profile, attempt, e, callStartedAt);
+        throw e;
+      }
       if (def == null) {
         continue; // 备用候选未注册：WARN 已记，跳过不落审计（FR-008）
       }
+      long gateStartedAt = System.currentTimeMillis();
       try {
         Attempt gated = applyBudgetGate(profile, attempt);
         if (gated != attempt) {
-          ProviderDef degraded = findDef(gated, true);
-          if (degraded == null) {
-            throw new BudgetExceededException(
-                "degrade provider not registered: " + gated.provider());
+          // throwIfMissing=true（闸点名的目标）：未注册时 findDef 直抛 PNFE，永不返回 null，故无 null 分支可判。
+          ProviderDef degraded;
+          try {
+            degraded = findDef(gated, true);
+          } catch (ProviderNotFoundException e) {
+            // 闸点名的目标不在注册表 ⇒ 持久性配置错误，不是值得换家的瞬时故障（静默换家只会把配错
+            // 永久藏成一条 WARN）。闸在 chatOnce 之前就失败，不补记则审计、失败指标与 LLM span 一起
+            // 为零（宪法 V）；审计行落 gated，排障直接看见是哪个 provider 没注册。
+            recordFailure(sessionId, profile, gated, e, gateStartedAt);
+            throw e;
           }
           return chatOnce(sessionId, profile, request, gated, degraded);
         }
         return chatOnce(sessionId, profile, request, attempt, def);
       } catch (BudgetExceededException e) {
+        // 预算闸在调用前拒绝，不会走到 chatOnce 的 recordFailure：不在这里补记，审计、失败指标与
+        // LLM span 会一起为零（宪法 V）。durationMs 只含闸检查耗时——真实调用没有发生。
+        recordFailure(sessionId, profile, attempt, e, gateStartedAt);
+        throw e;
+      } catch (ProviderNotFoundException e) {
+        // 分类（显式）：从本 try 逃出的 PNFE 都是点名类配置错误（闸目标未注册，或目标在调用前失
+        // 效），按 PNFE「点名报错，绝不静默换家」的契约上抛，不参与 FallbackClassifier 的「未知
+        // 异常偏向切换」默认。主 provider 未注册的抛出在 try 之外，换备用有用，不受此处影响。
+        // 审计只在失败点记（上面补记 / chatOnce 内 invokeChat 已记），这里不重复记账。
         throw e;
       } catch (RuntimeException e) {
         last = e;
@@ -168,7 +196,20 @@ public class SpringAiProviderServiceImpl implements ProviderService {
         switchWarn(profile, attempt, attempts.get(i + 1), e);
       }
     }
-    throw last != null ? last : new ProviderNotFoundException(profile.provider().name());
+    if (last != null) {
+      throw last; // 候选真的失败过：失败审计已由 chatOnce/invokeChat 记，不重复记账
+    }
+    // 没有任何候选能进入调用（例如 routing 把声明主过滤掉、剩余候选又全未注册）：与上面同口径补记，
+    // 否则整次调用在审计里不存在（宪法 V）。异常与审计行点名同一个 provider（声明主），可对账。
+    ProviderNotFoundException nobodyAvailable =
+        new ProviderNotFoundException(profile.provider().name());
+    recordFailure(
+        sessionId,
+        profile,
+        new Attempt(profile.provider().name(), profile.provider().model()),
+        nobodyAvailable,
+        callStartedAt);
+    throw nobodyAvailable;
   }
 
   /** 单次尝试（023）：attempt 的 name/model 贯穿路由、Prompt 与审计（R2）。 */
@@ -217,11 +258,14 @@ public class SpringAiProviderServiceImpl implements ProviderService {
       ProviderRequest request,
       Attempt attempt,
       ProviderDef def) {
-    ChatModel model = resolveModel(def);
-    Prompt prompt = buildPrompt(profile, request, attempt.model());
+    // 建模型与建 Prompt 也要落在 try 内：它们失败的原因（凭证缺失、base-url 非法、
+    // 工具 inputSchema 为空）都是配置类故障，恰恰是审计最该留下痕迹的一类。放在 try 外时
+    // 这些异常绕过 recordFailure，审计、失败指标与 LLM span 三者一起为零，排障只剩一个 500。
     long startedAt = System.currentTimeMillis();
     ProviderResponse result;
     try {
+      ChatModel model = resolveModel(def);
+      Prompt prompt = buildPrompt(profile, request, attempt.model());
       ChatResponse response = model.call(prompt);
       result = toProviderResponse(response);
     } catch (RuntimeException e) {
@@ -240,39 +284,81 @@ public class SpringAiProviderServiceImpl implements ProviderService {
     return attempts;
   }
 
-  /** 051 / #477：enabled 时按策略重排/过滤 Agent 声明候选；disabled 时等同 attemptsOf。 */
+  /**
+   * 051 / #477：enabled 时按策略重排/过滤 Agent 声明候选；disabled 时等同 attemptsOf。
+   *
+   * <p>两个分支返回前都去一次重（{@link #distinctCandidates}）：routing 只重排/过滤声明候选，既不新增也不删除重复， 所以声明里的重复会原样流进
+   * {@code attemptOrder}——去重放在这里才能同时覆盖 routing 开与关两条路径。
+   */
   private List<Attempt> resolveAttempts(Profile profile) {
     ModelRoutingService routing = this.modelRouting;
     if (routing == null || !routing.isEnabled()) {
-      return attemptsOf(profile);
+      return distinctCandidates(attemptsOf(profile));
     }
     RoutingDecision decision = routing.route(profile);
     List<Attempt> out = new ArrayList<>();
     for (RoutingCandidate c : decision.attemptOrder()) {
       out.add(new Attempt(c.provider(), c.model()));
     }
-    return out.isEmpty() ? attemptsOf(profile) : out;
+    return distinctCandidates(out.isEmpty() ? attemptsOf(profile) : out);
   }
 
-  /** 主 provider 未注册直抛（现状口径）；备用候选未注册 WARN 返回 null 跳过（FR-008）。 */
-  private ProviderDef findDef(Attempt attempt, boolean primary) {
+  /**
+   * 尝试序列去重：同一候选只保留第一次出现。
+   *
+   * <p>为什么这是修复而不是优化：Profile 把主 provider 又写进 fallback（复制粘贴常见）时，未去重会把同一端点连打两轮。
+   * 第二轮面对的是同一个端点、同一个请求，拿不到任何新信息，只会多一条失败审计、并在切换日志里留下「deepseek →
+   * deepseek」这种自指——读日志的人得先分辨这是配置重复还是真的发生了切换。
+   *
+   * <p>去重键是 {@code (provider, model)} 一对（{@link Attempt} 是 record，相等性就是这两个分量）：同 provider 不同 model
+   * 是两个合法候选（换模型是真实的重试手段，可能改变结果），不能合并。保留第一次出现的位置，声明的优先级不变。
+   */
+  private static List<Attempt> distinctCandidates(List<Attempt> attempts) {
+    return List.copyOf(new LinkedHashSet<>(attempts));
+  }
+
+  /**
+   * 未注册时：点名类目标直抛，备用候选 WARN 并返回 null 跳过（FR-008）。
+   *
+   * <p>{@code throwIfMissing} 由「这个目标是不是被点名的」决定，不再由尝试序号决定——routing 开启时 {@code attemptOrder}
+   * 会被提权、按成本重排、按 residency 过滤，位置 0 只表示「本轮先试哪家」，不再等于 Profile 声明的主。点名类目标有两个来源：Profile 声明主（{@link
+   * #isDeclaredPrimary}）与预算闸点名的降级目标。
+   */
+  private ProviderDef findDef(Attempt attempt, boolean throwIfMissing) {
     var def = registry.find(attempt.provider());
     if (def.isPresent()) {
       return def.get();
     }
-    if (primary) {
+    if (throwIfMissing) {
       throw new ProviderNotFoundException(attempt.provider());
     }
     LOG.warn("fallback 候选 provider 未注册，跳过: {}", sanitize(attempt.provider()));
     return null;
   }
 
-  /** 切换留痕（FR-006）：WARN 带 from→to（MDC 自带 traceId）+ 切换计数；指标异常不伤主链路。 */
+  /**
+   * 声明主判据是 Profile 里那一条 {@code (provider, model)}，不是尝试序列的位置：051 routing 会重排候选。
+   *
+   * <p>比一对而不是只比 provider 名：同 provider 不同 model 的备用被提权到首位时它不是声明主；按名字判会把它当成主，未注册时又回到「整次调用硬失败」。
+   */
+  private static boolean isDeclaredPrimary(Profile profile, Attempt attempt) {
+    return Objects.equals(attempt.provider(), profile.provider().name())
+        && Objects.equals(attempt.model(), profile.provider().model());
+  }
+
+  /**
+   * 切换留痕（FR-006）：WARN 带 from→to 的完整候选标识（MDC 自带 traceId）+ 切换计数；指标异常不伤主链路。
+   *
+   * <p>两侧都打 {@code provider/model}：同 provider 的不同 model 是合法候选（#1002 去重键是 (provider, model) 一对），只打
+   * provider 名会把这种重试写成「broken → broken」，读起来像自指/死循环。
+   */
   private void switchWarn(Profile profile, Attempt from, Attempt to, RuntimeException cause) {
     LOG.warn(
-        "provider 切换: {} → {}（原因: {}）",
+        "provider 切换: {}/{} → {}/{}（原因: {}）",
         sanitize(from.provider()),
+        sanitize(from.model()),
         sanitize(to.provider()),
+        sanitize(to.model()),
         sanitize(cause.getMessage()));
     try {
       metrics.recordFallbackSwitch(from.provider(), to.provider());
@@ -309,17 +395,52 @@ public class SpringAiProviderServiceImpl implements ProviderService {
       Profile profile,
       ProviderRequest request,
       java.util.function.Consumer<String> onToken) {
+    long callStartedAt = System.currentTimeMillis();
     List<Attempt> attempts = resolveAttempts(profile);
     RuntimeException last = null;
     for (int i = 0; i < attempts.size(); i++) {
       Attempt attempt = attempts.get(i);
-      ProviderDef def = findDef(attempt, i == 0);
+      ProviderDef def;
+      try {
+        def = findDef(attempt, isDeclaredPrimary(profile, attempt));
+      } catch (ProviderNotFoundException e) {
+        // 与 chat 同口径：声明主未注册不换家，但必须补记一行失败审计（宪法 V）。
+        recordFailure(sessionId, profile, attempt, e, callStartedAt);
+        throw e;
+      }
       if (def == null) {
         continue;
       }
       boolean[] contentStarted = new boolean[1];
+      long gateStartedAt = System.currentTimeMillis();
       try {
+        Attempt gated = applyBudgetGate(profile, attempt);
+        if (gated != attempt) {
+          // throwIfMissing=true（闸点名的目标）：未注册时 findDef 直抛 PNFE，永不返回 null，故无 null 分支可判。
+          ProviderDef degraded;
+          try {
+            degraded = findDef(gated, true);
+          } catch (ProviderNotFoundException e) {
+            // 与 chat 同口径：闸点名的目标不在注册表 ⇒ 持久性配置错误，不是值得换家的瞬时故障。闸在建流
+            // 之前就失败，不补记则审计、失败指标与 LLM span 一起为零；审计行落 gated，排障直接看见是哪个
+            // provider 没注册。
+            recordFailure(sessionId, profile, gated, e, gateStartedAt);
+            throw e;
+          }
+          return chatStreamOnce(
+              sessionId, profile, request, onToken, gated, degraded, contentStarted);
+        }
         return chatStreamOnce(sessionId, profile, request, onToken, attempt, def, contentStarted);
+      } catch (BudgetExceededException budget) {
+        // 与 chat 同口径（:161）：预算拒绝不切备用——换一家 provider 改不了预算裁决，静默切换反而把
+        // 决定藏起来。留一行失败审计，否则流式路径上的拒绝会连 llm_calls/指标/span 一起为零。
+        recordFailure(sessionId, profile, attempt, budget, gateStartedAt);
+        throw budget;
+      } catch (ProviderNotFoundException e) {
+        // 分类（显式）：从本 try 逃出的 PNFE 都是点名类配置错误（闸目标未注册，或目标在建流前失效），按
+        // PNFE「点名报错、绝不静默换家」的契约上抛，不参与 FallbackClassifier 的「未知异常偏向切换」默认。
+        // 审计只在失败点记（上面补记 / invokeChat 已记），这里不重复记账。
+        throw e;
       } catch (RuntimeException e) {
         last = e;
         // 023 R4：首个内容片段已流出后绝不切换——重试必然重复输出，按 019 error 语义收尾（FR-007）
@@ -329,7 +450,19 @@ public class SpringAiProviderServiceImpl implements ProviderService {
         switchWarn(profile, attempt, attempts.get(i + 1), e);
       }
     }
-    throw last != null ? last : new ProviderNotFoundException(profile.provider().name());
+    if (last != null) {
+      throw last;
+    }
+    // 与 chat 同口径：没有任何候选进入调用时也要留一行失败审计（宪法 V）。
+    ProviderNotFoundException nobodyAvailable =
+        new ProviderNotFoundException(profile.provider().name());
+    recordFailure(
+        sessionId,
+        profile,
+        new Attempt(profile.provider().name(), profile.provider().model()),
+        nobodyAvailable,
+        callStartedAt);
+    throw nobodyAvailable;
   }
 
   private ProviderResponse chatStreamOnce(
@@ -388,13 +521,13 @@ public class SpringAiProviderServiceImpl implements ProviderService {
       Attempt attempt,
       ProviderDef def,
       boolean[] contentStarted) {
-    ChatModel model = resolveModel(def);
-    Prompt prompt = buildPrompt(profile, request, attempt.model());
     long startedAt = System.currentTimeMillis();
     StringBuilder text = new StringBuilder();
     ToolCallAggregator toolCalls = new ToolCallAggregator();
     Usage usage = null;
     try {
+      ChatModel model = resolveModel(def);
+      Prompt prompt = buildPrompt(profile, request, attempt.model());
       for (ChatResponse chunk : model.stream(prompt).toIterable()) {
         Generation generation = chunk.getResult();
         if (generation != null && generation.getOutput() != null) {
@@ -659,7 +792,10 @@ public class SpringAiProviderServiceImpl implements ProviderService {
     if (usage.completionTokens() != null && completionPrice != null) {
       micros += Math.round(usage.completionTokens() * completionPrice);
     }
-    return micros;
+    // 金额不为负：负单价（定价 API 已拒绝，但老库可能已有）或负用量都会算成负数，在这里统一夹到 0。
+    // 审计（llm_calls）、指标（cost_micros）、账本三处都消费这一个返回值，夹在这个唯一出口它们才不会各说各话；
+    // 负价本身没有丢——它留在 llm_pricing 行里，而负数不是金额。
+    return Math.max(0L, micros);
   }
 
   /** 按 provider 名缓存已建的 ChatModel；同名下 key/url 变化即原地重建替换（provider CRUD 改了配置立即生效，旧实例可回收）。 */
@@ -673,6 +809,24 @@ public class SpringAiProviderServiceImpl implements ProviderService {
                     ? cached
                     : new CachedModel(fingerprint, chatModelBuilder.apply(def)))
         .model();
+  }
+
+  /**
+   * 回收：{@code ProviderRegistry} 删除 provider 后，这里丢掉按名缓存的 ChatModel，否则它的 HTTP 客户端会随每次增删累积。
+   *
+   * <p>只摘引用、不 close 实例：删除可能撞上进行中的调用，而正在执行的线程持有自己的 ChatModel 引用，关掉它会把这次调用打断。 摘引用之后旧实例不可达，由 GC
+   * 回收（其客户端不再被新调用复用）。
+   *
+   * <p>残留竞态与「为什么接受」：一条在途调用若在删除前已从注册表取到 {@link ProviderDef}、删除后才走到这里重建模型， 条目会被重新建回去。接受它，因为：①
+   * 每次删除最多残留一个条目（不是每次调用、不是每次删除都累加）；② 它只在删除恰好撞上 一条进行中的调用时发生，而删除是低频的管理动作；③ 彻底关掉要么给每一次 LLM
+   * 调用都加一次注册表查询（热路径上的 DB 代价， 远大于这条竞态的量级），要么引入删除代际计数——不成比例。
+   */
+  @Override
+  public void evict(String providerName) {
+    if (providerName == null || providerName.isBlank()) {
+      return;
+    }
+    cache.remove(providerName);
   }
 
   /** {@code model} 为本次尝试的模型名（023）：备用候选必须用备用模型名，不再固定取主声明。 */
@@ -883,8 +1037,14 @@ public class SpringAiProviderServiceImpl implements ProviderService {
     return false;
   }
 
+  /**
+   * 请求内容类 4xx（模型拒收图片/链接失效等）——剥 media 再试可能成功。
+   *
+   * <p>认证/余额/限流/超时类换一家才有用（补集见 {@link FallbackClassifier#isSwitchableClientStatus(int)}），剥 media
+   * 只是把同一个失败请求再打一遍：402 余额耗尽曾因此被判成客户端错误，先剥远程图、再剥全部 media，每条都记一次必然失败的 {@code llm_calls}，最后仍不切备用。
+   */
   private static boolean isClientHttpStatus(int code) {
-    return code >= 400 && code < 500 && code != 401 && code != 403 && code != 408 && code != 429;
+    return code >= 400 && code < 500 && !FallbackClassifier.isSwitchableClientStatus(code);
   }
 
   private static ProviderResponse toProviderResponse(ChatResponse response) {

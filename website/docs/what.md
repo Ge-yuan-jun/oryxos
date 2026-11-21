@@ -1,84 +1,52 @@
 # What is OryxOS
 
-***OryxOS is the self-hosted Agent Operating System for the enterprise. Describe a task in plain language — OryxOS breaks it down, assembles a team of agents, and they collaborate to deliver the result. So every company can run its own agents, in plain language.***
+**OryxOS is an open-source, self-hosted Agent Harness OS for enterprise AI applications.** It is the operating foundation where enterprises run Agents in controlled context, environments, tools, permissions, and governance.
 
-![one sentence → decompose → assemble an agent team → collaborate → deliver the result](/images/pipeline-en.svg)
+![OryxOS architecture overview](/images/oryxos-overview-en.svg)
 
-![OryxOS Architecture](/images/architecture.svg)
+Teams use OryxOS to build their own applications: engineering automation, knowledge support, ticket collaboration, operations diagnostics, and more. The application owns its business rules, data, integrations, and user experience. OryxOS provides the shared runtime beneath it.
 
-## Where we are on that road
+## An enterprise harness, not a single Agent
 
-We say exactly what's shipped and what's ahead — no hand-waving:
+Models and Agents will keep changing. Codex, Claude Code, Gemini, and in-house Agents should be replaceable executors. What an enterprise needs to retain is the environment in which those executors work:
 
-- **Shipped today**: define an agent in **one sentence** (or one markdown directory) and it goes live instantly — no restart, no code. It comes with memory, 24 built-in tools, MCP connectors, a global skill library, notifications, cron scheduling, sandboxed execution, and a full audit trail — running entirely on your own infrastructure.
-- **The north star** (in active design — see the [Roadmap](./roadmap)): publish a task in one sentence and an agent **team** self-organizes to deliver it — a planner decomposes, specialists work in parallel, a reviewer merges and checks — every step audited, with humans approving the dangerous ones.
+- the business context and knowledge they may use;
+- the systems, Tools, and permissions they may act through;
+- the policy, approval, and sandbox boundaries they must respect;
+- the acceptance criteria and evidence that prove a task is complete;
+- the trace, cost, evaluation, and feedback that improve the next execution.
 
-## The Agent formula
+That is an **Agent Harness**. OryxOS makes it shared infrastructure rather than rebuilding it inside every application.
 
-Everything an agent needs is **built into the OS**. An agent is just a declaration of intent that references those capabilities by name:
+## The execution path
 
-![natural language + Memory + Tools + MCP + Skills + Knowledge + Notify = a working Agent](/images/agent-formula-en.svg)
+Applications compose the Agents, models, Knowledge, Tools, MCP servers, and Flows they need. But meaningful actions take a common, governed path:
 
-This is the whole point of OryxOS: **drive the cost of defining an agent toward zero.** You write what you want; the OS supplies the capabilities, the safety rails, and the audit trail.
+```text
+Task → Context / Environment → Identity / Authorization → Policy / Approval
+     → Model / Tool Execution → Artifact / Evidence → Audit / Trace / Cost → State Update
+```
 
-Concretely, **one directory = one Agent**: a folder under `.oryxos/agents/<name>/` with an `AGENT.md` — YAML frontmatter as the agent's profile (identity, which LLM it talks to, which tools/skills it references) plus a body of task instructions. Drop the directory in and it goes live. Create, edit, and delete agents at runtime over the REST API or the web console — including generating a complete agent from a single sentence. Business systems integrate over HTTP. Data never leaves your infrastructure.
+Applications can compose capabilities freely; they cannot bypass governance. Governance is part of execution, not a report produced after it.
 
-## What is an agent harness (and why an OS)
+## What the OS provides
 
-An **agent harness** is the scaffolding around a model that turns it into a working agent: the loop that drives reason → act → observe, the tools it can call and the execution that runs them, the context assembled before every LLM call, the memory it accumulates, the sandbox that contains it, and the audit trail that records what it did. A bare model only generates text — the harness is what lets it *do* things, reliably and safely.
+| Layer | Responsibility |
+| --- | --- |
+| **Task Runtime** | Lifecycle, state, sessions, artifacts, durable work, recovery, and human interaction. |
+| **Context and environment** | Knowledge, memory, enterprise connections, and controlled execution environments. |
+| **Capabilities** | Model routing, Tools, MCP, Skills, and extensible integrations. |
+| **Governance** | Identity, authorization, policy, approval, sandbox boundaries, and audit. |
+| **Operations** | Trace, evidence, cost attribution, evaluation, reliability, and feedback. |
 
-An enterprise never runs just one agent. OryxOS is an **Agent Harness OS**: it gives every agent the same production-grade harness, and runs the whole fleet like an operating system runs processes. Three layers — **Model → Harness → OS**:
+## Current state
 
-| | Bare Model | Agent Harness | Agent Harness OS |
-| --- | --- | --- | --- |
-| Scope | A single LLM call | One reliable agent | A fleet of agents |
-| Provides | Text generation | Loop, tools + execution, context, memory, sandbox, audit, delivery | Lifecycle, channels, routing, shared registries, scheduling, governance, admin + API |
-| Entry point | An API call to a model | A library or framework call | A deployable binary with a REST API |
-| Multi-agent | Not in scope | Not in scope | First-class: many agents, shared capabilities, runtime lifecycle management |
-| Analogy | A CPU instruction | A process with its runtime | An OS running many processes |
+The single-node Runtime is available today: Agent definitions, model Providers, Memory, Knowledge, built-in Tools, MCP, Skills, scheduling, sandbox controls, audit records, REST APIs, and the Web Manager.
 
-A model generates text. A harness turns one model into one agent that actually works. A Harness **OS** gives every agent the same harness and runs the whole fleet — and it's the layer where an agent *team* becomes possible.
+Durable Tasks, checkpoints and recovery, approvals, policy distribution, model routing and cost operations, evaluation, and distributed execution are evolving capabilities. See the [Roadmap](./roadmap).
 
-## Five Core Capabilities
+## Why call it an OS
 
-### LLM Routing
+A model generates text. A harness gives an Agent context, tools, memory, execution, and boundaries. An **Agent Harness OS** gives many enterprise applications the same runtime contracts and governance path.
 
-Provider abstraction over mainstream models: DeepSeek, Qwen, Kimi, Zhipu, Hunyuan, Doubao, Anthropic, OpenAI, and any OpenAI-protocol-compatible endpoint. Agents are provider-agnostic — an agent declares which provider to use by name and never knows which vendor is behind the call. Providers live in a dynamic registry with full CRUD (over REST or the console) — seeded from config on first startup, then authoritative in the database, so you add or re-key a provider at runtime with no restart. Multiple providers co-exist via explicit name-to-model routing, and local inference via Ollama or vLLM is supported.
-
-### ReAct Loop
-
-A self-implemented reasoning engine — no external agent framework wrapping it. Each iteration: assemble the prompt (system prompt + bootstrap context + long-term memory + conversation history + available tools), call the LLM, inspect the response for tool calls, execute them under the sandbox, thread the results back as structured tool messages, repeat — until the LLM produces a final answer or the iteration limit is reached. The entire loop is a few dozen lines and fully inspectable; protocol differences between vendors are absorbed by an adapter layer, while tool execution stays entirely under OryxOS's control.
-
-### Memory
-
-Two layers today. Session memory holds the conversation history, persisted and recoverable across restarts. Long-term memory is **per-agent** — each agent writes to its own `MEMORY.md` via `save_memory` and searches it via `recall_memory`; every trigger is also auto-recorded to its archival memory. The memory is injected into every system prompt so agents keep context across conversations. The upgrade path — semantic, vector-backed memory plus a built-in knowledge base — is a headline item on the [Roadmap](./roadmap).
-
-### Tool System
-
-**24 built-in tools** cover the baseline: file operations (read / write / list / append / move / copy / delete / mkdir), shell, HTTP (get / post / arbitrary request / fetch-webpage / download), time and JSON utilities, memory, and `notify`. All execute under sandbox enforcement — path whitelist for files, command whitelist for shell, and **split HTTP policy** (reads: default allow + SSRF blocklist; writes: domain wildcard whitelist) — with every invocation audited. The `notify` tool pushes to named channels (Feishu / WeCom / DingTalk / Slack / Discord / Telegram / WhatsApp / Teams / Google Chat / Mattermost / Matrix / generic webhook), themselves a dynamic registry with full CRUD.
-
-Extension follows three tiers, ordered by effort:
-
-| Tier | Effort | Approach |
-| --- | --- | --- |
-| Zero-code | Lowest | Write a `SKILL.md` describing the task, reference existing community MCP servers |
-| Light-code | Medium | Write an MCP server in any language; OryxOS connects as MCP Client |
-| Heavy-code | Highest | Write a native in-process tool and register it directly |
-
-All tools — built-in, MCP-backed, and native — register through one `ToolRegistry` and expose a uniform interface to the ReAct loop.
-
-### REST API & Web Console
-
-A REST API under `/api/v1` exposes everything to external systems: dynamic agent lifecycle (create / list / get / update / delete / invoke, plus per-agent memory, console session, and one-sentence generation), sessions, provider and notify-channel CRUD, schedules, sandbox whitelist management, a workspace file browser, tool inventory, health, and runtime info — all wrapped in one response envelope. Any language that speaks HTTP integrates; no SDK required.
-
-On top of it sits a web console at `/admin/`: an overview dashboard, agent management with the one-sentence creation flow, file browser with markdown rendering, skills, schedules, sessions, providers, notify channels, and the sandbox whitelist.
-
-## Design Principles
-
-- **Platform before Agent** — the most important deliverable is the environment that lets any agent run reliably, not any particular agent
-- **Self-implement the core, reuse the plumbing** — the reasoning loop is written by hand; vendor protocol adapters are delegated to a mature adapter layer
-- **One directory = one Agent** — an agent is defined by a directory of markdown, not by code
-- **Open standards** — MCP for tools, A2A for agent-to-agent collaboration, open formats for skills
-- **Stateless instances, externalized state** — the prerequisite for going distributed without an architectural rewrite
-- **Security as foundation, not afterthought** — least privilege, mandatory sandbox whitelists, credentials via environment variables, full audit trail persisted from day one
-- **Phased and disciplined** — build the minimal complete runtime kernel first; governance and distributed infrastructure come next, proven by real usage
+OryxOS is deliberately generic. A research-and-development Harness may add code repositories, native coding Agents, CI, browsers, and device testing. A support Harness may add CRM, ticketing, and human handoff. Those are applications built on OryxOS; the OS provides the common execution and control plane.

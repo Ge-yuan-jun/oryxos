@@ -11,15 +11,20 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.oryxos.core.profile.Profile;
 import io.oryxos.core.provider.LlmCallAuditor;
 import io.oryxos.core.provider.ProviderDef;
 import io.oryxos.core.provider.ProviderRegistry;
 import io.oryxos.core.provider.ProviderRequest;
 import io.oryxos.core.provider.ProviderResponse;
+import io.oryxos.core.session.Message;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +33,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
@@ -93,6 +99,52 @@ class ProviderFallbackTest {
   private static RestClientResponseException badRequest() {
     return new RestClientResponseException(
         "bad request", 400, "st", new HttpHeaders(), new byte[0], StandardCharsets.UTF_8);
+  }
+
+  private static RestClientResponseException paymentRequired() {
+    return new RestClientResponseException(
+        "payment required", 402, "st", new HttpHeaders(), new byte[0], StandardCharsets.UTF_8);
+  }
+
+  /** 带一张远程图片的请求：402 若被当成"请求内容类 4xx"，就会触发剥 media 的降级链。 */
+  private static ProviderRequest requestWithRemoteImage() {
+    Message user =
+        new Message(
+            Message.ROLE_USER,
+            "图片链接: https://example.com/a.png",
+            null,
+            null,
+            List.of(),
+            List.of(new Message.MediaPart("image/png", "https://example.com/a.png")));
+    return new ProviderRequest(null, List.of(user), List.of());
+  }
+
+  private static List<?> userMedia(Prompt prompt) {
+    return ((UserMessage) prompt.getInstructions().get(0)).getMedia();
+  }
+
+  /** 只挂 {@link SpringAiProviderServiceImpl} 这个命名 logger，避免收进别处的日志。 */
+  private static ListAppender<ILoggingEvent> attachSwitchLogAppender() {
+    ListAppender<ILoggingEvent> appender = new ListAppender<>();
+    appender.start();
+    ((ch.qos.logback.classic.Logger)
+            org.slf4j.LoggerFactory.getLogger(SpringAiProviderServiceImpl.class))
+        .addAppender(appender);
+    return appender;
+  }
+
+  private static void detachSwitchLogAppender(ListAppender<ILoggingEvent> appender) {
+    ((ch.qos.logback.classic.Logger)
+            org.slf4j.LoggerFactory.getLogger(SpringAiProviderServiceImpl.class))
+        .detachAppender(appender);
+    appender.stop();
+  }
+
+  private static List<ILoggingEvent> switchWarnings(ListAppender<ILoggingEvent> appender) {
+    return appender.list.stream()
+        .filter(event -> event.getLevel() == Level.WARN)
+        .filter(event -> event.getFormattedMessage().contains("provider 切换"))
+        .toList();
   }
 
   @Test
@@ -239,6 +291,79 @@ class ProviderFallbackTest {
     order.verify(primary).call(any(Prompt.class));
     order.verify(backup).call(any(Prompt.class));
     order.verify(primary).call(any(Prompt.class));
+  }
+
+  @Test
+  void 余额耗尽402_不剥media重试_直接切到备用() {
+    RestClientResponseException paymentRequired = paymentRequired();
+    when(primary.call(any(Prompt.class))).thenThrow(paymentRequired);
+    when(backup.call(any(Prompt.class))).thenReturn(reply("备用回复"));
+
+    ProviderResponse response =
+        service.chat(
+            "s-1",
+            profileWithFallback(new Profile.ProviderRef.FallbackRef("backup", "b-model")),
+            requestWithRemoteImage());
+
+    assertThat(response.text()).isEqualTo("备用回复");
+    // 402 是账户状态：同一请求剥 media 换不来成功，主调用只该发生一次
+    ArgumentCaptor<Prompt> primaryPrompt = ArgumentCaptor.forClass(Prompt.class);
+    verify(primary, times(1)).call(primaryPrompt.capture());
+    assertThat(userMedia(primaryPrompt.getValue())).as("402 不该触发 media 降级：主调用必须带着原始图片").hasSize(1);
+    // 备用拿到的是原始请求（媒体未被剥离）
+    ArgumentCaptor<Prompt> backupPrompt = ArgumentCaptor.forClass(Prompt.class);
+    verify(backup, times(1)).call(backupPrompt.capture());
+    assertThat(userMedia(backupPrompt.getValue())).as("切到备用时媒体应原样带上").hasSize(1);
+    // 审计恰两条：主失败 + 备成功，而不是 media 重试链打出的更多条
+    verify(audit, times(2))
+        .record(any(), any(), any(), any(), any(), any(), anyBoolean(), any(), anyLong());
+  }
+
+  @Test
+  void 同provider不同model_切换日志带完整provider与model_不写成自指() {
+    when(primary.call(any(Prompt.class)))
+        .thenThrow(new ResourceAccessException("first model down"))
+        .thenReturn(reply("换模型接住"));
+
+    ListAppender<ILoggingEvent> appender = attachSwitchLogAppender();
+    try {
+      ProviderResponse response =
+          service.chat(
+              "s-1",
+              profileWithFallback(new Profile.ProviderRef.FallbackRef("primary", "p-model-2")),
+              request());
+      assertThat(response.text()).isEqualTo("换模型接住");
+    } finally {
+      detachSwitchLogAppender(appender);
+    }
+
+    List<ILoggingEvent> switches = switchWarnings(appender);
+    assertThat(switches).hasSize(1);
+    assertThat(switches.get(0).getFormattedMessage())
+        .as("同 provider 不同 model 是合法候选（#1002），日志要能看出不是自指")
+        .contains("provider 切换: primary/p-model → primary/p-model-2")
+        .doesNotContain("primary → primary");
+  }
+
+  @Test
+  void 不同provider_切换日志仍带两段完整标识() {
+    when(primary.call(any(Prompt.class))).thenThrow(new ResourceAccessException("down"));
+    when(backup.call(any(Prompt.class))).thenReturn(reply("备用回复"));
+
+    ListAppender<ILoggingEvent> appender = attachSwitchLogAppender();
+    try {
+      service.chat(
+          "s-1",
+          profileWithFallback(new Profile.ProviderRef.FallbackRef("backup", "b-model")),
+          request());
+    } finally {
+      detachSwitchLogAppender(appender);
+    }
+
+    List<ILoggingEvent> switches = switchWarnings(appender);
+    assertThat(switches).hasSize(1);
+    assertThat(switches.get(0).getFormattedMessage())
+        .contains("provider 切换: primary/p-model → backup/b-model");
   }
 
   @Test

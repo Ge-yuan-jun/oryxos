@@ -5,6 +5,87 @@
 
 ## [Unreleased]
 
+## [0.1.9-RELEASE] - 2026-11-01
+
+### Added
+- 贡献流程以 Issue 为中心：六种结构化 Issue 表单、提案与任务标签，并禁用空白 Issue（#1054）。
+- Provider 凭证默认走无密钥 mock；落库 API key 在管理台掩码展示，留空替换字段则保留原凭证（#1052）。
+
+### Changed
+- 官网与文档重排为企业级 Agent Harness OS 定位；README 精简，详细说明迁入 `docs/README-reference*`（#1058/#1059/#1063）。
+- `package.sh` 打包脚本整理（#1061）。
+- 依赖升级：Spring Boot 4.1.1 → 4.1.2、Spring AI 2.0.1 → 2.0.2、Swagger UI 5.33.2 → 5.34.0、Apache POI OOXML 5.5.1 → 6.0.0；GitHub Actions 补丁升级（#1047/#1048/#1049）。
+
+### Fixed
+- 飞书通知渠道可编辑签名密钥；同类型更新时省略或未改的掩码敏感项保留，清空则删除（#1050）。
+- 授权审计：`request_method` / `resource_type` 按列宽截断，避免超长写入失败后拒绝记录丢失（#1042）。
+- 无 scheme 的 webhook URL 在渠道视图中按凭证掩码（#1038）。
+- Pages 文档链接修正（#1060）。
+
+### Tests
+- 补齐确定性拒绝映射、SSE 断开与心跳、SSE 监听载荷、版本化资产指针、跨库约束冲突、CLI init 幂等、知识库协调语义等契约覆盖（#1039~#1046）。
+
+### Docs
+- README 版本徽章升级至 0.1.9；Helm `appVersion`、健康检查契约示例与 A2A Agent Card 默认版本对齐 `0.1.9-RELEASE`。
+
+## [0.1.8-RELEASE] - 2026-10-19
+
+### Added
+- 健康检查回显构建版本：`/api/v1/health` 返回与 Maven 产物同源的 `version` 和 git `build`（#961）。
+- 成本看板：按 session / trace 下钻成本（#962）。
+- ReAct：按 Agent 配置 `max_iterations` 收敛策略（`error` | `summarize`）（#749）。
+- 渠道调用方校验：入站 webhook 可要求调用方令牌，集群模式强制校验；Google Chat / Teams 校验调用方 JWT；无令牌渠道启动时告警（#951/#953/#954/#955）。
+- Telegram 长轮询超时可配（#960）。
+- 运维提示：集群跑在本地工作区存储上时 CLI 告警（#1018）；路由策略没有信号源时告警（#1015）；MCP 仍使用已弃用 SSE 传输时告警（#1001）。
+
+### Changed
+- 依赖升级：MCP SDK 迁移到 **2.1.0**（生产代码未改；stdio / SSE / streamable 与 `auto` 回退由工具模块用例与 5 个 MCP E2E 复验）；`git-commit-id` 插件 9 → 10（`/api/v1/health` 的 `build` 字段实测仍由 `git.properties` 填充）；OpenTelemetry BOM、飞书 SDK、SpotBugs、Swagger UI 与 GitHub Actions 的补丁升级（#1027/#1028/#1034/#1036）。
+- 渠道模块归到 `channels/` 聚合（#747）。
+- Maven 最低版本提高到构建实际所需版本；依赖与 GitHub Actions 小版本升级（#939/#948/#949）。
+- 缺省日程时区统一为 UTC（#848）。
+- LLM 调用的连接、读取与整次请求超时分开配置（#893）。
+
+### Fixed
+- 确定性拒绝在 JSON 与 SSE 中都返回 4xx（#1033）；audit / evals 前缀的写方法默认拒绝（#976）；补登记曾挡住 RBAC 启动的端点（#968）。
+- 工作区控制台文件 API 只暴露实际可浏览的根（#1025/#1032）；主密钥文件视为保留系统文件（#1020）；启动在监听端口之前拒绝非法配置（#1021）。
+- CLI：输入错误单行报出、轻量命令失败非零退出、数据源占位符用 Spring 解析、生成主密钥前先过密钥守卫、删除 Agent 归档并抬工作区版本、provider 列表读注册表（#1006~#1014/#1031）。
+- 知识库：删除限定所属库、路径入口校验库名、拒绝清单同名与软链别名、重启续跑中断文档（含集群）、向量宽度不一致时拒绝向量路由、切分前统一换行（#875~#995/#1022）。
+- 渠道：长回复分段（含企微客服、Matrix、Teams）、只剥离本机器人提及、签名常量时间比较、Webhook/WebSocket 连接按条释放并限时关闭、钉钉回复 @ 对应提问者、WhatsApp 读取媒体说明（#905~#937/#993/#999/#1003/#1024）。
+- Provider 与成本：402 切换备用、预算门禁覆盖流式调用、负成本钳为零、删除后丢弃缓存客户端、失败尝试先落审计再重试（#873/#970/#973/#974/#977/#996/#997/#1002/#1005）。
+- 审计与账本在 SQL 内聚合，并为时间窗加索引（#899/#1010/#1016）；webhook URL 落库加密（#1012）；停用账号不再解析出角色（#871）。
+- 其他：ReAct 中断时补齐 tool result（#758）；日程触发时刻落库以便核对恰好一次（#950）；两副本同时做启动播种不再互相踩（#972）；`make_dir` 不再把 `AGENT.md` 槽位变成目录（#927）；SSH 参数逐个引用（#923）。
+
+### Docs
+- 模块结构与 29 个 Maven 模块对齐；修正三处与代码不符的行为描述和四处渠道上限注释（#941/#942/#1026）。
+- README 版本徽章升级至 0.1.8；Helm `appVersion`、健康检查契约示例与 A2A Agent Card 默认版本对齐 `0.1.8-RELEASE`。
+
+## [0.1.7-RELEASE] - 2026-10-08
+
+### Added
+- A2A 互通：发布 Agent Card、JSON-RPC `message/send` 与 `message/stream`（SSE）、出站客户端 + `a2a_send` 工具、共享令牌鉴权、`X-A2A-Hop` 跳数上限（#704/#706/#708/#710/#712/#716）。
+- 团队任务（Direction I）：协调者编排 API、专家并行扇出、after/dependsOn 波次调度、失败有界重规划、JPA 持久化与 `GET /api/v1/team-tasks`、耐久 HITL 挂起/恢复、审批策略门禁、成本归因、远程 A2A 节点路由；CLI `team-task run/get/list`（#687~#740）。
+- Flow：AGENT 节点接入 `FlowAgentRunner`、TEAM_TASK 节点桥接团队编排、自然语言生成 Flow Markdown 草稿（#684/#690/#742/#744）。
+- 能力目录：统一 `CapabilityRef` 目录与按轮能力叠加（#746/#753）。
+- 工具与沙箱：进程内 `delegate_agent` 交接、docker 后端 `execute_code`、SSH 执行后端（#685/#686/#694）。
+- MCP：Streamable HTTP 传输（`sse` 别名）与首连自动选择 HTTP 传输（#678/#725）。
+- 评测：审计 trace 导出为 EvalCase 夹具（#696）。
+
+### Changed
+- Spring Boot starter parent 与 logstash-logback-encoder 等依赖升级；CI Actions 版本升级，PMD 暂锁 7.27.0（#726/#727/#813/#814 等）。
+- 检出统一换行符规范化（#755）；gitleaks 下载失败自动重试（#757）。
+
+### Fixed
+- 10 MiB 读写上限补齐：PersonaStore、AgentStore、工作区写入、知识上传、CLI 导入/展示、文件工具等（#650~#677）。
+- 渠道可靠性：租约续期/释放/回滚、去重认领释放、配额与媒体限制、长回复分段代理对、凭证掩码不回写、Telegram 媒体下载与令牌校验、钉钉 webhook 令牌不入错误信息（#777~#825）。
+- MCP：重名/无名配置拒绝、关闭时断开连接、存活探测、先持久化再拆旧连接、空 env/headers 提示、凭证掩码（#768~#858）。
+- 沙箱：未知执行后端拒绝而非回退本机、`execute_code` 按实际后端门禁、SSRF 判断隧道真实地址；路径边界判定穿透软链（#832/#847/#852/#854）。
+- 记忆：工具缺参拒绝、SQLite 档关键词大小写折叠与 `%`/`_` 字面匹配、embedding 维度变化重建向量索引（#845/#856/#860）。
+- 其他：Web 控制器与所注入 bean 同条件注册、RBAC 开启时 A2A 端点可启动、A2A 网关按映射后路径判定、`chat --profile` 拒绝不存在的 Agent、团队任务依赖等待与计划解析、集群心跳须短于租约（#751/#762/#766/#767/#770/#774/#786）。
+
+### Docs
+- 039 RBAC 用户角色面文档、Vision/roadmap 状态同步、Windows 需在 WSL2 内启动服务说明（#641/#688）。
+- README 版本徽章升级至 0.1.7；Helm `appVersion` 与 A2A Agent Card 默认版本对齐 `0.1.7-RELEASE`。
+
 ## [0.1.6-RELEASE] - 2026-09-23
 
 ### Added

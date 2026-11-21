@@ -1,0 +1,377 @@
+package io.oryxos.channel.wecom;
+
+import com.fasterxml.jackson.core.JacksonException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/** 企微智能机器人 WebSocket 长连接：订阅鉴权、心跳、收帧、发帧。自动重连由外层适配器控制。 */
+class WeComWsClient implements WebSocket.Listener {
+
+  private static final Logger LOG = LoggerFactory.getLogger(WeComWsClient.class);
+
+  static final String DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com";
+  private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(20);
+  private static final long HEARTBEAT_INTERVAL_SEC = 30;
+  private static final long WS_CLOSE_TIMEOUT_MS = 2_000L;
+  private static final String FIELD_ERRCODE = "errcode";
+  private static final String FIELD_ERRMSG = "errmsg";
+  private static final String CMD_AIBOT_SUBSCRIBE = "aibot_subscribe";
+  private static final String CMD_PING = "ping";
+  private static final String CMD_PONG = "pong";
+  private static final int ERRCODE_OK = 0;
+  private static final ObjectMapper MAPPER = new ObjectMapper();
+
+  private final String botId;
+  private final String secret;
+  private final String wsUrl;
+  private final Consumer<JsonNode> onFrame;
+  private final Runnable onDisconnected;
+
+  private final AtomicReference<WebSocket> socket = new AtomicReference<>();
+  private final AtomicBoolean subscribed = new AtomicBoolean(false);
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+  private final StringBuilder textBuf = new StringBuilder();
+  private final CountDownLatch subscribeLatch = new CountDownLatch(1);
+  private volatile String subscribeError;
+
+  /** 承载 WebSocket 的 HttpClient：持有 selector 线程，连接生命周期内必须存活、关闭时必须释放。 */
+  private volatile HttpClient httpClient;
+
+  private final Supplier<HttpClient> httpClientFactory;
+
+  private ScheduledExecutorService heartbeat;
+  private ScheduledFuture<?> heartbeatTask;
+
+  WeComWsClient(
+      String botId,
+      String secret,
+      String wsUrl,
+      Consumer<JsonNode> onFrame,
+      Runnable onDisconnected) {
+    this(botId, secret, wsUrl, onFrame, onDisconnected, WeComWsClient::newHttpClient);
+  }
+
+  /** 单测缝：注入 HttpClient 工厂，让「持有但不触网」的客户端可测（连接仍由 connectAndSubscribe 建立）。 */
+  WeComWsClient(
+      String botId,
+      String secret,
+      String wsUrl,
+      Consumer<JsonNode> onFrame,
+      Runnable onDisconnected,
+      Supplier<HttpClient> httpClientFactory) {
+    this.botId = Objects.requireNonNull(botId);
+    this.secret = Objects.requireNonNull(secret);
+    this.wsUrl = wsUrl == null || wsUrl.isBlank() ? DEFAULT_WS_URL : wsUrl;
+    this.onFrame = Objects.requireNonNull(onFrame);
+    this.onDisconnected = onDisconnected == null ? () -> {} : onDisconnected;
+    this.httpClientFactory = Objects.requireNonNull(httpClientFactory, "httpClientFactory");
+  }
+
+  /** 长连接用的 HttpClient（selector 线程 + 连接池随连接存活）：本客户端持有，closeQuietly() 释放。 */
+  static HttpClient newHttpClient() {
+    return HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
+  }
+
+  /** 懒创建：适配器/测试都不需要为了拿引用而先真的连一次。 */
+  HttpClient httpClient() {
+    HttpClient current = httpClient;
+    if (current != null) {
+      return current;
+    }
+    synchronized (this) {
+      if (httpClient == null) {
+        httpClient = httpClientFactory.get();
+      }
+      return httpClient;
+    }
+  }
+
+  void connectAndSubscribe(Duration timeout) throws Exception {
+    closed.set(false);
+    HttpClient client = httpClient();
+    boolean established = false;
+    try {
+      CompletableFuture<WebSocket> future =
+          client
+              .newWebSocketBuilder()
+              .connectTimeout(CONNECT_TIMEOUT)
+              .buildAsync(URI.create(wsUrl), this);
+      WebSocket ws;
+      try {
+        ws = future.get(timeout.toSeconds(), TimeUnit.SECONDS);
+      } catch (java.util.concurrent.TimeoutException e) {
+        // 不取消的话迟到连接会变幽灵：onOpen 照发订阅且可能成功，但无人持有引用
+        future.cancel(true);
+        throw e;
+      } catch (InterruptedException e) {
+        future.cancel(true);
+        Thread.currentThread().interrupt();
+        throw e;
+      }
+      socket.set(ws);
+      if (!subscribeLatch.await(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+        throw new IllegalStateException("企微长连接订阅超时（未收到 " + CMD_AIBOT_SUBSCRIBE + " 回执）");
+      }
+      if (subscribeError != null) {
+        throw new IllegalStateException("企微长连接订阅失败: " + subscribeError);
+      }
+      if (!subscribed.get()) {
+        throw new IllegalStateException("企微长连接订阅失败（未知原因）");
+      }
+      established = true;
+    } finally {
+      if (!established) {
+        // 建连失败（含 DNS/TLS/订阅超时）：适配器会丢弃这个客户端且不调 stop()，selector 线程必须在这里释放
+        closeQuietly();
+      }
+    }
+  }
+
+  boolean isSubscribed() {
+    return subscribed.get() && !closed.get();
+  }
+
+  void sendJson(ObjectNode frame) {
+    WebSocket ws = socket.get();
+    if (ws == null || closed.get()) {
+      throw new IllegalStateException("企微长连接未建立，无法发送");
+    }
+    try {
+      String payload = MAPPER.writeValueAsString(frame);
+      ws.sendText(payload, true).join();
+    } catch (Exception e) {
+      throw new IllegalStateException("企微长连接发送失败: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * 限时关闭：{@code sendClose().join()} 偶发不返回时放弃等待（对齐飞书/Slack/Discord/QQ），守护线程后台继续。
+   *
+   * <p>{@code stop()} 在 synchronized 里调用本方法，对端不回应 FIN 时裸 join 会占住渠道监视器与 ChannelAdminService
+   * 监视器，之后所有渠道的增删改与停机钩子一起挂住。
+   *
+   * <p>HttpClient 的释放放在限时关闭之后而不是里面：close 超时被放弃时，selector 线程照样必须释放。
+   */
+  void closeQuietly() {
+    closed.set(true);
+    subscribed.set(false);
+    stopHeartbeat();
+    WebSocket ws = socket.getAndSet(null);
+    if (ws != null) {
+      Thread closer =
+          Thread.ofPlatform()
+              .daemon(true) // 守护：被放弃的 close 不得阻止 JVM 退出
+              .name("oryxos-wecom-ws-close")
+              .unstarted(
+                  () -> {
+                    try {
+                      closeWebSocket(ws);
+                    } catch (RuntimeException ignored) {
+                      // ignore
+                    }
+                  });
+      closer.start();
+      try {
+        closer.join(WS_CLOSE_TIMEOUT_MS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      if (closer.isAlive()) {
+        LOG.warn("企微 WS close {}ms 未返回，放弃等待（守护线程后台继续）", WS_CLOSE_TIMEOUT_MS);
+      }
+    }
+    HttpClient client = httpClient;
+    httpClient = null;
+    if (client != null) {
+      client.shutdownNow(); // 释放 selector 线程；不关会泄漏至 GC（重连风暴下累积）
+    }
+  }
+
+  /** 单测缝：让「对端不回应 FIN、close 永不返回」可注入（同 {@code KnowledgeWatcher.newWatchService()}）。 */
+  void closeWebSocket(WebSocket ws) {
+    ws.sendClose(WebSocket.NORMAL_CLOSURE, "bye").join();
+  }
+
+  @Override
+  public void onOpen(WebSocket webSocket) {
+    webSocket.request(1);
+    ObjectNode body = MAPPER.createObjectNode();
+    body.put("bot_id", botId);
+    body.put("secret", secret);
+    ObjectNode headers = MAPPER.createObjectNode();
+    headers.put("req_id", UUID.randomUUID().toString());
+    ObjectNode frame = MAPPER.createObjectNode();
+    frame.put("cmd", CMD_AIBOT_SUBSCRIBE);
+    frame.set("headers", headers);
+    frame.set("body", body);
+    try {
+      webSocket.sendText(MAPPER.writeValueAsString(frame), true);
+    } catch (Exception e) {
+      subscribeError = e.getMessage();
+      subscribeLatch.countDown();
+    }
+  }
+
+  @Override
+  public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+    textBuf.append(data);
+    if (last) {
+      String raw = textBuf.toString();
+      textBuf.setLength(0);
+      handleText(raw);
+    }
+    webSocket.request(1);
+    return null;
+  }
+
+  @Override
+  public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
+    webSocket.request(1);
+    return null;
+  }
+
+  @Override
+  public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+    markDisconnected();
+    socket.set(null);
+    onDisconnected.run();
+    return null;
+  }
+
+  @Override
+  public void onError(WebSocket webSocket, Throwable error) {
+    LOG.warn("企微长连接错误: {}", sanitize(error == null ? null : error.getMessage()));
+    if (!subscribed.get()) {
+      subscribeError = error == null ? "unknown" : error.getMessage();
+    }
+    markDisconnected();
+    socket.set(null);
+    onDisconnected.run();
+  }
+
+  private void markDisconnected() {
+    closed.set(true);
+    subscribed.set(false);
+    stopHeartbeat();
+    subscribeLatch.countDown();
+  }
+
+  private void handleText(String raw) {
+    JsonNode root;
+    try {
+      root = MAPPER.readTree(raw);
+    } catch (JacksonException e) {
+      LOG.warn("企微帧 JSON 解析失败，已忽略");
+      return;
+    }
+    if (!subscribed.get() && root.has(FIELD_ERRCODE)) {
+      handleSubscribeAck(root);
+      return;
+    }
+    String cmd = root.path("cmd").asText("");
+    if (isIgnorableControlFrame(cmd, root)) {
+      return;
+    }
+    try {
+      onFrame.accept(root);
+    } catch (RuntimeException e) {
+      LOG.error("企微帧处理异常: {}", sanitize(e.getMessage()));
+    }
+  }
+
+  private void handleSubscribeAck(JsonNode root) {
+    int code = root.path(FIELD_ERRCODE).asInt(-1);
+    if (code == ERRCODE_OK) {
+      subscribed.set(true);
+      startHeartbeat();
+      subscribeLatch.countDown();
+      return;
+    }
+    subscribeError = root.path(FIELD_ERRMSG).asText(FIELD_ERRCODE + "=" + code);
+    subscribeLatch.countDown();
+  }
+
+  private static boolean isIgnorableControlFrame(String cmd, JsonNode root) {
+    if (CMD_PONG.equals(cmd)) {
+      return true;
+    }
+    if (cmd.isBlank() && root.has(FIELD_ERRCODE)) {
+      int code = root.path(FIELD_ERRCODE).asInt(ERRCODE_OK);
+      if (code != ERRCODE_OK) {
+        // 无 cmd + errcode 的帧是平台对 fire-and-forget 发送（aibot_send_msg）的失败回执——
+        // 静默吞掉会让「回复没发出去」零痕迹（对齐 dingtalk #342 的 fail-loud 口径）
+        LOG.warn(
+            "企微平台回执错误 errcode={} errmsg={}", code, sanitize(root.path(FIELD_ERRMSG).asText("")));
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private void startHeartbeat() {
+    stopHeartbeat();
+    ScheduledThreadPoolExecutor pool =
+        new ScheduledThreadPoolExecutor(
+            1,
+            r -> {
+              Thread t = new Thread(r, "wecom-ws-heartbeat");
+              t.setDaemon(true);
+              return t;
+            });
+    pool.setRemoveOnCancelPolicy(true);
+    heartbeat = pool;
+    heartbeatTask =
+        heartbeat.scheduleAtFixedRate(
+            () -> {
+              try {
+                ObjectNode headers = MAPPER.createObjectNode();
+                headers.put("req_id", UUID.randomUUID().toString());
+                ObjectNode frame = MAPPER.createObjectNode();
+                frame.put("cmd", CMD_PING);
+                frame.set("headers", headers);
+                sendJson(frame);
+              } catch (RuntimeException e) {
+                LOG.warn("企微心跳失败: {}", sanitize(e.getMessage()));
+              }
+            },
+            HEARTBEAT_INTERVAL_SEC,
+            HEARTBEAT_INTERVAL_SEC,
+            TimeUnit.SECONDS);
+  }
+
+  private void stopHeartbeat() {
+    if (heartbeatTask != null) {
+      heartbeatTask.cancel(false);
+      heartbeatTask = null;
+    }
+    if (heartbeat != null) {
+      heartbeat.shutdownNow();
+      heartbeat = null;
+    }
+  }
+
+  private static String sanitize(String value) {
+    return value == null ? "" : value.replace('\r', '_').replace('\n', '_');
+  }
+}

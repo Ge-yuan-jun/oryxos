@@ -30,6 +30,7 @@ class WorkspaceApiControllerTest {
 
   @TempDir Path oryxosRoot;
   private MockMvc mvc;
+  private WorkspaceApiController controller;
   private io.oryxos.core.agent.AgentLifecycleService lifecycle;
 
   @BeforeEach
@@ -40,7 +41,12 @@ class WorkspaceApiControllerTest {
     lifecycle = org.mockito.Mockito.mock(io.oryxos.core.agent.AgentLifecycleService.class);
     bumpedDomains.clear();
     localReloads.set(0);
-    mvc = mvcWith(clusterRefreshService());
+    controller =
+        new WorkspaceApiController(oryxosRoot.toString(), lifecycle, clusterRefreshService());
+    mvc =
+        MockMvcBuilders.standaloneSetup(controller)
+            .setControllerAdvice(new GlobalExceptionHandler())
+            .build();
   }
 
   // 027 refresh 端点：集群档 bump 全域 / 单机档本地重载（可观测的记录桩）
@@ -132,14 +138,67 @@ class WorkspaceApiControllerTest {
   }
 
   @Test
-  @DisplayName("tree 返回 agents/archive 结构、可钻进 Agent 目录列文件")
+  @DisplayName("tree 返回存在的四个默认可读根、可钻进 Agent 目录列文件")
   void tree_returnsAgentsAndArchive() throws Exception {
+    // 树只列存在的目录：这里把四个默认可读根都建出来，验证默认配置下的结构
+    Files.createDirectories(oryxosRoot.resolve("skills"));
+    Files.createDirectories(oryxosRoot.resolve("output"));
     mvc.perform(get("/api/v1/workspace/tree"))
         .andExpect(status().isOk())
         .andExpect(
             jsonPath("$.data.children[*].name")
                 .value(org.hamcrest.Matchers.hasItems("agents", "skills", "output", "archive")))
         .andExpect(jsonPath("$.data.children[0].children[0].name").value("demo"));
+  }
+
+  @Test
+  @DisplayName("tree 跟着 readable-roots 走：改成 agents,custom 后列 custom、不列 output/archive")
+  void tree_followsConfiguredReadableRoots() throws Exception {
+    Files.createDirectories(oryxosRoot.resolve("custom"));
+    Files.createDirectories(oryxosRoot.resolve("output"));
+    setReadableRoots("agents,custom");
+
+    mvc.perform(get("/api/v1/workspace/tree"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.children.length()").value(2))
+        .andExpect(
+            jsonPath("$.data.children[*].name")
+                .value(org.hamcrest.Matchers.hasItems("agents", "custom")))
+        .andExpect(
+            jsonPath(
+                "$.data.children[*].name",
+                org.hamcrest.Matchers.not(org.hamcrest.Matchers.hasItem("output"))))
+        .andExpect(
+            jsonPath(
+                "$.data.children[*].name",
+                org.hamcrest.Matchers.not(org.hamcrest.Matchers.hasItem("archive"))));
+  }
+
+  @Test
+  @DisplayName("tree 只列存在的目录：缺失的根不出现（避免点进去 404）")
+  void tree_omitsMissingRoots() throws Exception {
+    // setUp 建了 archive/；默认配置下 skills/、output/ 不存在 —— 树里只应有 agents 与 archive
+    mvc.perform(get("/api/v1/workspace/tree"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.children.length()").value(2))
+        .andExpect(
+            jsonPath("$.data.children[*].name")
+                .value(org.hamcrest.Matchers.contains("agents", "archive")));
+
+    // 删掉 archive/ 后它也不再出现
+    Files.delete(oryxosRoot.resolve("archive"));
+    mvc.perform(get("/api/v1/workspace/tree"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.children.length()").value(1))
+        .andExpect(jsonPath("$.data.children[0].name").value("agents"));
+  }
+
+  /** 模拟 {@code oryxos.web.workspace.readable-roots} 注入（@Value 字段只在 Spring 装配时赋值）。 */
+  private void setReadableRoots(String setting) throws Exception {
+    java.lang.reflect.Field field =
+        WorkspaceApiController.class.getDeclaredField("readableRootsSetting");
+    field.setAccessible(true);
+    field.set(controller, setting);
   }
 
   @Test
@@ -530,5 +589,119 @@ class WorkspaceApiControllerTest {
         .andExpect(jsonPath("$.message", containsString("10 MiB")));
     org.junit.jupiter.api.Assertions.assertFalse(
         Files.exists(oryxosRoot.resolve("output/huge.txt")));
+  }
+
+  @Test
+  @DisplayName("master.key 是系统保留文件：workspace file/download/write 一律 400，且密钥内容不得被改写")
+  void masterKeyIsReservedForReadAndWrite() throws Exception {
+    // 主密钥真实存在于工作区根（{oryxosRoot}/master.key，022）—— 正是通用读路径能触达的位置
+    Path key = oryxosRoot.resolve("master.key");
+    Files.writeString(key, "BASE64-MASTER-KEY");
+    String original = Files.readString(key);
+
+    mvc.perform(get("/api/v1/workspace/file").param("path", "master.key"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.message", containsString("master.key")));
+    mvc.perform(get("/api/v1/workspace/file").param("path", "MASTER.KEY"))
+        .andExpect(status().isBadRequest());
+    mvc.perform(get("/api/v1/workspace/download").param("path", "master.key"))
+        .andExpect(status().isBadRequest());
+    // "./" 前缀不能绕过：守卫按路径段判定，"." 段不影响后面的保留名段
+    mvc.perform(get("/api/v1/workspace/file").param("path", "./master.key"))
+        .andExpect(status().isBadRequest());
+    mvc.perform(get("/api/v1/workspace/download").param("path", "master.key"))
+        .andExpect(
+            content().string(org.hamcrest.Matchers.not(containsString("BASE64-MASTER-KEY"))));
+    mvc.perform(
+            post("/api/v1/workspace/file")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"path\":\"master.key\",\"content\":\"ATTACKER-REPLACED\"}"))
+        .andExpect(status().isBadRequest());
+
+    org.junit.jupiter.api.Assertions.assertEquals(original, Files.readString(key), "主密钥不得被通用写入口改写");
+  }
+
+  @Test
+  @DisplayName("目录白名单：读入口只放行四个树根，logs/ 与自建目录一律 400")
+  void readIsLimitedToTheAllowlistedRoots() throws Exception {
+    Files.createDirectories(oryxosRoot.resolve("logs"));
+    Files.writeString(oryxosRoot.resolve("logs/app.log"), "log line");
+    Files.createDirectories(oryxosRoot.resolve("custom"));
+    Files.writeString(oryxosRoot.resolve("custom/notes.md"), "custom notes");
+
+    mvc.perform(get("/api/v1/workspace/file").param("path", "logs/app.log"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.message", containsString("工作区根之外")));
+    mvc.perform(get("/api/v1/workspace/download").param("path", "logs/app.log"))
+        .andExpect(status().isBadRequest());
+    mvc.perform(get("/api/v1/workspace/file").param("path", "custom/notes.md"))
+        .andExpect(status().isBadRequest());
+    // 允许的根照常可读（archive/ 在默认可读白名单里）
+    Files.createDirectories(oryxosRoot.resolve("archive/2026"));
+    Files.writeString(oryxosRoot.resolve("archive/2026/report.md"), "archived");
+    mvc.perform(get("/api/v1/workspace/file").param("path", "archive/2026/report.md"))
+        .andExpect(status().isOk());
+  }
+
+  @Test
+  @DisplayName("目录白名单：写入口不放行自建目录，也不放行 skills/（绑定视图只读）")
+  void writeIsLimitedToTheWritableRoots() throws Exception {
+    mvc.perform(
+            post("/api/v1/workspace/file")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"path\":\"custom/notes.md\",\"content\":\"x\"}"))
+        .andExpect(status().isBadRequest());
+    mvc.perform(
+            post("/api/v1/workspace/file")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"path\":\"skills/demo/SKILL.md\",\"content\":\"x\"}"))
+        .andExpect(status().isBadRequest());
+    org.junit.jupiter.api.Assertions.assertFalse(
+        Files.exists(oryxosRoot.resolve("custom/notes.md")), "被拒的写不得落盘");
+  }
+
+  @Test
+  @DisplayName("目录白名单可由配置放宽：readable-roots 含 custom 后该目录可读")
+  void readableRootsCanBeRelaxedByConfiguration() throws Exception {
+    Files.createDirectories(oryxosRoot.resolve("custom"));
+    Files.writeString(oryxosRoot.resolve("custom/notes.md"), "custom notes");
+    WorkspaceApiController controller =
+        controllerWithRoots("agents,skills,output,archive,custom", null);
+
+    MockMvc relaxed =
+        MockMvcBuilders.standaloneSetup(controller)
+            .setControllerAdvice(new GlobalExceptionHandler())
+            .build();
+    relaxed
+        .perform(get("/api/v1/workspace/file").param("path", "custom/notes.md"))
+        .andExpect(status().isOk())
+        .andExpect(content().string(containsString("custom notes")));
+  }
+
+  @Test
+  @DisplayName("目录白名单配置非法（含 ..）时启动校验直接抛，不静默降级")
+  void illegalAllowlistConfigurationFailsFast() throws Exception {
+    WorkspaceApiController controller = controllerWithRoots("../etc", null);
+    org.junit.jupiter.api.Assertions.assertThrows(
+        IllegalStateException.class, controller::warnOnRelaxedRoots);
+  }
+
+  private WorkspaceApiController controllerWithRoots(String readable, String writable)
+      throws Exception {
+    WorkspaceApiController controller =
+        new WorkspaceApiController(oryxosRoot.toString(), lifecycle, clusterRefreshService());
+    if (readable != null) {
+      java.lang.reflect.Field f =
+          WorkspaceApiController.class.getDeclaredField("readableRootsSetting");
+      f.setAccessible(true);
+      f.set(controller, readable);
+    }
+    if (writable != null) {
+      java.lang.reflect.Field f =
+          WorkspaceApiController.class.getDeclaredField("writableRootsSetting");
+      f.setAccessible(true);
+      f.set(controller, writable);
+    }
+    return controller;
   }
 }

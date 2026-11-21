@@ -1,12 +1,17 @@
 package io.oryxos.core.channel;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.oryxos.core.policy.AssetGovernance;
 import io.oryxos.core.profile.Profile;
 import io.oryxos.core.profile.ProfileRegistry;
@@ -19,6 +24,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 /** 017 T019：渠道管理——断旧建新顺序、校验失败不落盘、启动恢复不带病上线。 */
 class ChannelAdminServiceTest {
@@ -235,5 +241,223 @@ class ChannelAdminServiceTest {
 
     assertTrue(!cleared.isPresent());
     assertNull(loader.loadRaw().get(0).governance());
+  }
+
+  @Test
+  @DisplayName("回滚一次已被取代的连接：不得摘掉新世代的登记（否则连接活着却再也停不掉）")
+  void supersededRollbackKeepsTheNewAdapter() {
+    // 只有独连型（wecom）才走属主协调分支
+    ChannelAdminService svc =
+        new ChannelAdminService(
+            loader,
+            registry,
+            profileRegistry,
+            Map.of("wecom", c -> new TrackingAdapter(c.name(), c.agent())));
+    ChannelLeaseCoordinator coordinator = mock(ChannelLeaseCoordinator.class);
+    java.util.concurrent.atomic.AtomicReference<
+            java.util.function.Consumer<ChannelLeaseCoordinator.Loss>>
+        stopCallback = new java.util.concurrent.atomic.AtomicReference<>();
+    org.mockito.Mockito.doAnswer(
+            inv -> {
+              stopCallback.set(inv.getArgument(2));
+              return null;
+            })
+        .when(coordinator)
+        .manage(
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any());
+    svc.setChannelLeaseCoordinator(coordinator);
+
+    svc.add(new ChannelConfig("chan-w", "wecom", "app-id", "app-secret", "ops-agent", true));
+    assertNotNull(stopCallback.get(), "独连型渠道应当交给属主协调器");
+
+    // 新世代已经把它自己的适配器登记上去 —— 这正是 #779 那条时序的后半段
+    InboundChannelAdapter newer = new TrackingAdapter("chan-w", "ops-agent");
+    registry.register(newer);
+
+    // 旧世代回滚：渠道名下的登记此刻属于新世代，回滚不能碰它
+    stopCallback.get().accept(ChannelLeaseCoordinator.Loss.SUPERSEDED);
+    assertEquals(
+        Optional.of(newer),
+        registry.get("chan-w"),
+        "回滚不该摘掉新世代的适配器 —— 摘掉之后 stopOne 的 registry.get 找不到它，" + "连接活着却停不掉");
+
+    // 对照：真丢了租约（fencing）时，登记应当降为离线
+    stopCallback.get().accept(ChannelLeaseCoordinator.Loss.FENCED);
+    assertTrue(registry.get("chan-w").isEmpty(), "fencing 应当把连接降为离线");
+  }
+
+  @Test
+  @DisplayName("落盘失败时不得先把旧连接拆掉（否则运行态没了、磁盘仍写着在用）")
+  void saveFailureKeepsTheRunningChannel() {
+    // 写盘失败：只读卷 / 磁盘满 / 权限变更 —— ChannelConfigLoader.save 会抛 UncheckedIOException
+    ChannelConfigLoader failing = mock(ChannelConfigLoader.class);
+    when(failing.loadRaw()).thenReturn(List.of(config("chan-a", "ops-agent", true)));
+    when(failing.resolve(org.mockito.ArgumentMatchers.any())).thenAnswer(inv -> inv.getArgument(0));
+    org.mockito.Mockito.doThrow(new java.io.UncheckedIOException(new java.io.IOException("只读卷")))
+        .when(failing)
+        .save(org.mockito.ArgumentMatchers.any());
+
+    ChannelAdminService svc =
+        new ChannelAdminService(
+            failing,
+            registry,
+            profileRegistry,
+            Map.of("stub", c -> new TrackingAdapter(c.name(), c.agent())));
+    // 模拟「该渠道正在运行」
+    TrackingAdapter running = new TrackingAdapter("chan-a", "ops-agent");
+    running.start();
+    registry.register(running);
+    lifecycle.setLength(0);
+
+    assertThrows(
+        java.io.UncheckedIOException.class,
+        () -> svc.update("chan-a", config("chan-a", "ops-agent", true)));
+
+    // 关键：保存失败发生在断连【之前】，所以连接应当还在
+    assertTrue(registry.get("chan-a").isPresent(), "落盘失败时渠道应当继续运行（磁盘仍是旧配置，运行态应与之一致）");
+    assertTrue(
+        !lifecycle.toString().contains("stop:chan-a"), "不该在保存成功之前就断开连接，实际生命周期: " + lifecycle);
+  }
+
+  @Test
+  @DisplayName("删除渠道时落盘失败：连接不得被拆掉")
+  void removeSaveFailureKeepsTheRunningChannel() {
+    ChannelConfigLoader failing = mock(ChannelConfigLoader.class);
+    when(failing.loadRaw()).thenReturn(List.of(config("chan-a", "ops-agent", true)));
+    when(failing.resolve(org.mockito.ArgumentMatchers.any())).thenAnswer(inv -> inv.getArgument(0));
+    org.mockito.Mockito.doThrow(new java.io.UncheckedIOException(new java.io.IOException("只读卷")))
+        .when(failing)
+        .save(org.mockito.ArgumentMatchers.any());
+
+    ChannelAdminService svc =
+        new ChannelAdminService(
+            failing,
+            registry,
+            profileRegistry,
+            Map.of("stub", c -> new TrackingAdapter(c.name(), c.agent())));
+    TrackingAdapter running = new TrackingAdapter("chan-a", "ops-agent");
+    running.start();
+    registry.register(running);
+    lifecycle.setLength(0);
+
+    assertThrows(java.io.UncheckedIOException.class, () -> svc.remove("chan-a"));
+
+    assertTrue(registry.get("chan-a").isPresent(), "落盘失败时渠道应当继续运行");
+    assertTrue(!lifecycle.toString().contains("stop:chan-a"), "实际生命周期: " + lifecycle);
+  }
+
+  // ---------- #918：未配置应用层兜底闸时的启动可见性 ----------
+
+  private static ListAppender<ILoggingEvent> attachAppender() {
+    ListAppender<ILoggingEvent> appender = new ListAppender<>();
+    appender.start();
+    ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(ChannelAdminService.class))
+        .addAppender(appender);
+    return appender;
+  }
+
+  private static void detachAppender(ListAppender<ILoggingEvent> appender) {
+    ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(ChannelAdminService.class))
+        .detachAppender(appender);
+  }
+
+  private static boolean warnedAboutMissingVerification(ListAppender<ILoggingEvent> appender) {
+    return appender.list.stream()
+        .anyMatch(
+            event ->
+                event.getLevel() == Level.WARN && event.getFormattedMessage().contains("未配置调用方校验"));
+  }
+
+  /** 只注册给定 type 的工厂；{@code callerVerified} 决定桩适配器是否自称「校验已配好」。 */
+  private ChannelAdminService adminFor(String type, boolean callerVerified) {
+    Map<String, Function<ChannelConfig, InboundChannelAdapter>> factories =
+        Map.of(
+            type,
+            c -> {
+              TrackingAdapter adapter = new TrackingAdapter(c.name(), c.agent());
+              if (!callerVerified) {
+                adapter.withoutCallerVerification();
+              }
+              return adapter;
+            });
+    return new ChannelAdminService(loader, registry, profileRegistry, factories);
+  }
+
+  private ChannelStatus statusOf(String name) {
+    return registry.statusAll().stream()
+        .filter(status -> status.name().equals(name))
+        .findFirst()
+        .orElseThrow();
+  }
+
+  @Test
+  @DisplayName("单机档 + 未配校验：上线成功，但必须留下告警")
+  void warnsWhenCallerTokenMissing() {
+    ListAppender<ILoggingEvent> appender = attachAppender();
+    try {
+      adminFor("gchat", false)
+          .add(new ChannelConfig("gc-1", "gchat", "app-id", "app-secret", "ops-agent", true));
+
+      assertTrue(warnedAboutMissingVerification(appender), "裸奔档应当告警，否则运维看不到");
+      assertNotNull(registry.get("gc-1"), "单机档只告警，不影响上线");
+    } finally {
+      detachAppender(appender);
+    }
+  }
+
+  @Test
+  @DisplayName("单机档 + 已配校验：不告警")
+  void silentWhenCallerTokenPresent() {
+    ListAppender<ILoggingEvent> appender = attachAppender();
+    try {
+      adminFor("teams", true)
+          .add(new ChannelConfig("tm-1", "teams", "app-id", "app-secret", "ops-agent", true));
+
+      assertFalse(warnedAboutMissingVerification(appender), "关上了闸就不该告警");
+    } finally {
+      detachAppender(appender);
+    }
+  }
+
+  @Test
+  @DisplayName("自带验签的渠道不告警（避免把正常渠道报成裸奔）")
+  void silentForChannelsWithTheirOwnVerification() {
+    ListAppender<ILoggingEvent> appender = attachAppender();
+    try {
+      admin.add(config("chan-plain", "ops-agent", true));
+
+      assertFalse(warnedAboutMissingVerification(appender), "非该闸覆盖的渠道不该被误报");
+    } finally {
+      detachAppender(appender);
+    }
+  }
+
+  @Test
+  @DisplayName("集群档 + 未配校验：拒绝上线并点名原因（fail-fast）")
+  void clusterRejectsChannelWithoutCallerVerification() {
+    ChannelAdminService service = adminFor("gchat", false);
+    service.setRequireCallerVerification(true);
+
+    service.add(new ChannelConfig("gc-2", "gchat", "app-id", "app-secret", "ops-agent", true));
+
+    assertTrue(registry.get("gc-2").isEmpty(), "集群档下未配校验的渠道不该上线");
+    ChannelStatus status = statusOf("gc-2");
+    assertEquals(ChannelStatus.State.ERROR, status.state());
+    assertTrue(status.error().contains("未配置入站调用方校验"), "错误应点名原因，实际: " + status.error());
+  }
+
+  @Test
+  @DisplayName("集群档 + 已配校验：照常上线")
+  void clusterAllowsChannelWithCallerVerification() {
+    ChannelAdminService service = adminFor("teams", true);
+    service.setRequireCallerVerification(true);
+
+    service.add(new ChannelConfig("tm-2", "teams", "app-id", "app-secret", "ops-agent", true));
+
+    assertNotNull(registry.get("tm-2"), "配好校验的渠道不该被集群档挡下");
+    assertEquals(ChannelStatus.State.CONNECTED, statusOf("tm-2").state());
   }
 }

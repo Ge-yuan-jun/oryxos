@@ -101,9 +101,12 @@ public class ChannelAdminService {
     if (merged.enabled()) {
       validateForLaunch(resolved);
     }
-    stopOne(name);
+    // 先落盘再断连（类注释钉的顺序）。反过来的话，save 失败（只读卷/磁盘满/权限）
+    // 会留下「运行态已拆、磁盘仍写着在用」的撕裂：GET /channels 读盘仍列出它，
+    // GET /channels/status 读登记表却整行消失，不重试就不会回来。
     existing.set(idx, merged);
     loader.save(existing);
+    stopOne(name);
     startOne(resolved);
     return merged;
   }
@@ -136,9 +139,10 @@ public class ChannelAdminService {
     if (idx < 0) {
       throw new IllegalArgumentException("渠道不存在: " + name);
     }
-    stopOne(name);
+    // 同上：先落盘再断连。save 失败时渠道继续按磁盘上的配置运行，两边一致。
     existing.remove(idx);
     loader.save(existing);
+    stopOne(name);
     registry.unregister(name);
   }
 
@@ -171,8 +175,49 @@ public class ChannelAdminService {
     }
   }
 
+  /**
+   * 渠道的入站调用方校验：配好了就放行；没配时按部署档位分流 —— 集群档拒绝上线（fail-fast），单机档只告警。
+   *
+   * <p>分档的理由：集群档通常意味着生产，裸奔的入站端点在那是实打实的风险；单机档多是本地开发，强制会把最简单的 路径也堵上。是否强制由装配层按 {@code
+   * oryxos.cluster.enabled} 调 {@link #setRequireCallerVerification} 决定。
+   *
+   * <p>「配好了没有」由渠道自己回答（{@link InboundChannelAdapter#callerVerificationConfigured()}）——
+   * 各渠道的配置键并不相同（{@code project_number} / {@code verify_caller_jwt} / {@code inbound_token}），
+   * 装配层不该去猜。
+   */
+  private void checkCallerVerification(ChannelConfig resolved, InboundChannelAdapter adapter) {
+    if (adapter.callerVerificationConfigured()) {
+      return;
+    }
+    if (requireCallerVerification) {
+      throw new IllegalArgumentException(
+          "渠道 "
+              + resolved.name()
+              + "（type="
+              + resolved.type()
+              + "）未配置入站调用方校验：集群档下拒绝上线。"
+              + "请为该渠道配置平台 JWT 校验（见 specs/026-im-channel-roadmap 与 issue #918），"
+              + "或退到单机档（oryxos.cluster.enabled=false）");
+    }
+    LOG.warn(
+        "入站渠道 {}（type={}）未配置调用方校验：任何能访问该端点的人都能驱动 Agent 推理。" + "单机档仅告警；集群档下该配置会被拒绝上线（#918）",
+        sanitize(resolved.name()),
+        sanitize(resolved.type()));
+  }
+
   /** 026：独连型渠道类型（单连接互踢语义，需属主协调）；集群档由 setChannelLeaseCoordinator 装配。 */
   private static final java.util.Set<String> EXCLUSIVE_CONNECTION_TYPES = java.util.Set.of("wecom");
+
+  /**
+   * 未配置调用方校验的渠道是否拒绝上线；装配层在集群档下设 {@code true}。
+   *
+   * <p>与 {@link #setChannelLeaseCoordinator} 同款：core 不认识「集群档」这个概念，档位判断留给装配层。 将来若要全档强制，改的也只是装配层那一行。
+   */
+  private volatile boolean requireCallerVerification;
+
+  public void setRequireCallerVerification(boolean required) {
+    this.requireCallerVerification = required;
+  }
 
   private volatile ChannelLeaseCoordinator channelLeaseCoordinator;
 
@@ -204,6 +249,7 @@ public class ChannelAdminService {
     try {
       validateForLaunch(resolved);
       InboundChannelAdapter adapter = adapterFactories.get(resolved.type()).apply(resolved);
+      checkCallerVerification(resolved, adapter);
       adapter.start();
       registry.register(adapter);
       LOG.info(
@@ -241,16 +287,22 @@ public class ChannelAdminService {
             registry.register(adapter);
             LOG.info("独连型渠道 {} 已由本副本接管上线", sanitize(resolved.name()));
           },
-          () -> {
+          loss -> {
             adapter.stop();
             connected.set(false);
-            registry.registerOffline(
-                new ChannelStatus(
-                    resolved.name(),
-                    resolved.type(),
-                    resolved.agent(),
-                    ChannelStatus.State.STANDBY,
-                    null));
+            // 只有真的丢了租约才把登记降为离线。回滚一次已被取代的连接时不能碰登记表：
+            // 渠道名下的登记此刻可能已经是新世代的适配器，而 registerOffline 会把适配器
+            // 从运行表摘掉（两个表必须互斥）—— 之后 stopOne 的 registry.get 就再也
+            // 找不到它，连接活着却没有登记、也停不掉。
+            if (loss == ChannelLeaseCoordinator.Loss.FENCED) {
+              registry.registerOffline(
+                  new ChannelStatus(
+                      resolved.name(),
+                      resolved.type(),
+                      resolved.agent(),
+                      ChannelStatus.State.STANDBY,
+                      null));
+            }
           },
           connected::get);
     } catch (RuntimeException e) {

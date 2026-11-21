@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.oryxos</groupId>
         <artifactId>oryxos</artifactId>
-        <version>0.1.6-RELEASE</version>
+        <version>0.1.9-RELEASE</version>
     </parent>
 
     <artifactId>oryxos-tool</artifactId>
@@ -27,7 +27,7 @@
         <dependency>
             <groupId>io.modelcontextprotocol.sdk</groupId>
             <artifactId>mcp</artifactId>
-            <version>0.18.3</version>
+            <version>2.1.0</version>
         </dependency>
         <dependency>
             <groupId>org.yaml</groupId>

@@ -3,6 +3,7 @@ package io.oryxos.web.controller;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.oryxos.core.provider.ProviderDef;
 import io.oryxos.core.provider.ProviderRegistry;
+import io.oryxos.core.provider.ProviderService;
 import io.oryxos.web.common.ApiResponse;
 import io.oryxos.web.controller.dto.CreateProviderRequest;
 import io.oryxos.web.controller.dto.ProviderConnectivityView;
@@ -24,7 +25,8 @@ import org.springframework.web.bind.annotation.RestController;
  * Provider 动态注册表 CRUD（第 31 节）：LLM 接入点运行时增删改，管理台管、运行时按名动态建 ChatModel。
  *
  * <p>薄转发给 {@link ProviderRegistry}。错误码沿用既有：name 冲突 / 定义非法 → 400；不存在 → 404；统一 {@code ApiResponse}
- * 信封。名为 {@code mock} 的 provider 免 base-url（走内置假模型），其余必须有 base-url。
+ * 信封。名为 {@code mock} 的 provider 免 api-key 与 base-url（走内置假模型），其余两者都必须给——与启动校验同规则， 不允许经 CRUD
+ * 落库一个系统自己会拒绝的 provider 定义。
  */
 @SuppressFBWarnings(
     value = {"SPRING_ENDPOINT", "EI_EXPOSE_REP2"},
@@ -38,10 +40,15 @@ public class ProviderApiController {
 
   private final ProviderRegistry registry;
   private final ProviderModelsService modelsService;
+  private final ProviderService providerService;
 
-  public ProviderApiController(ProviderRegistry registry, ProviderModelsService modelsService) {
+  public ProviderApiController(
+      ProviderRegistry registry,
+      ProviderModelsService modelsService,
+      ProviderService providerService) {
     this.registry = registry;
     this.modelsService = modelsService;
+    this.providerService = providerService;
   }
 
   @PostMapping
@@ -53,7 +60,7 @@ public class ProviderApiController {
     if (registry.exists(name)) {
       throw new IllegalArgumentException("provider 已存在: " + name); // → 400
     }
-    validate(name, req.baseUrl());
+    validate(name, req.apiKey(), req.baseUrl());
     ProviderDef saved =
         registry.save(new ProviderDef(name, req.apiKey(), req.baseUrl(), req.description()));
     return ApiResponse.ok(ProviderView.from(saved));
@@ -80,12 +87,14 @@ public class ProviderApiController {
         registry
             .find(name)
             .orElseThrow(() -> new ResourceNotFoundException("provider 不存在: " + name)); // → 404
-    validate(name, req.baseUrl());
-    // 前端编辑表单回填的是掩码值；提交掩码 = 未修改，保留原 key——否则打码值会覆盖真实 key
+    // 前端编辑表单回填的是掩码值；提交掩码 = 未修改，保留原 key——否则打码值会覆盖真实 key。
+    // 请求体省略 apiKey（JSON null）同样按"未修改"处理，保留原 key：REST 直连（curl / 集成脚本）少写一个
+    // 字段不该静默清空凭证。空串不是"未修改"，交给 validate 拒绝（400），避免把真实 key 覆盖成空值。
     String apiKey =
-        ProviderView.mask(existing.apiKey()).equals(req.apiKey())
+        req.apiKey() == null || ProviderView.mask(existing.apiKey()).equals(req.apiKey())
             ? existing.apiKey()
             : req.apiKey();
+    validate(name, apiKey, req.baseUrl());
     ProviderDef saved =
         registry.save(new ProviderDef(name, apiKey, req.baseUrl(), req.description()));
     return ApiResponse.ok(ProviderView.from(saved));
@@ -114,13 +123,23 @@ public class ProviderApiController {
       throw new ResourceNotFoundException("provider 不存在: " + name); // → 404
     }
     registry.delete(name);
+    // 注册表是唯一真相源，但 provider 侧仍按名缓存着已建的 ChatModel（内含 HTTP 客户端）。不在这里回收，
+    // 每删一个 provider 就永久留下一个不再被任何配置引用的客户端。
+    providerService.evict(name);
     return ApiResponse.ok(null);
   }
 
-  /** 非 mock 的 provider 必须有 base-url（否则运行时建不出 OpenAI 兼容 ChatModel）。 */
-  private static void validate(String name, String baseUrl) {
+  /**
+   * 非 mock 的 provider 必须有 api-key 与 base-url（否则运行时建不出 OpenAI 兼容 ChatModel，或退化成用环境里的 {@code
+   * OPENAI_API_KEY} 充当该 provider 的凭证）。规则与启动校验 {@link io.oryxos.provider.ProviderRegistryValidator}
+   * 同形：mock 免校验；api-key 非 null、非 blank、不含未解析的 {@code ${...}} 占位。错误消息只点名 provider 与缺失字段， 不回显任何凭证内容。
+   */
+  private static void validate(String name, String apiKey, String baseUrl) {
     if (MOCK.equals(name)) {
       return;
+    }
+    if (apiKey == null || apiKey.isBlank() || apiKey.contains("${")) {
+      throw new IllegalArgumentException("provider " + name + " 缺少 api-key");
     }
     if (baseUrl == null || baseUrl.isBlank()) {
       throw new IllegalArgumentException("provider " + name + " 缺少 base-url");

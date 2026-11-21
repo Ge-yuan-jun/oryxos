@@ -96,6 +96,36 @@ class McpConfigLoaderTest {
   }
 
   @Test
+  @DisplayName("server 条目缺 name 时点名报错，不再以启动期无名 NPE 收场")
+  void missingNameFailsLoud() throws IOException {
+    // The name keys the connection everywhere downstream: McpClientService indexes its clients by
+    // it and the admin API routes by it. An entry without one used to reach connect(), hit the null
+    // key of a ConcurrentHashMap, and bring the whole context down with a message naming nothing.
+    write(
+        """
+        servers:
+          - transport: stdio
+            command: echo
+        """);
+    IllegalArgumentException missing =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(missing.getMessage().contains("缺少 name"), missing::getMessage);
+
+    write(
+        """
+        servers:
+          - name: ""
+            transport: stdio
+            command: echo
+        """);
+    IllegalArgumentException blank =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(blank.getMessage().contains("缺少 name"), blank::getMessage);
+  }
+
+  @Test
   @DisplayName("headers/env 非映射时 fail-loud，缺省仍为空 map")
   void envAndHeadersMustBeMaps() throws IOException {
     write(
@@ -140,6 +170,53 @@ class McpConfigLoaderTest {
     assertEquals(1, ok.size());
     assertTrue(ok.get(0).env().isEmpty());
     assertEquals("Bearer ${TOKEN}", ok.get(0).headers().get("Authorization"));
+  }
+
+  @Test
+  @DisplayName("env/headers 的空值点名报错、空键跳过")
+  void envAndHeadersNullValueIsNamedAndNullKeyIsSkipped() throws IOException {
+    // 空值以前被 continue 静默丢掉（`TOKEN:` 配了个空的凭证，谁都不知道）；
+    // 空键以前 put(null, …) 让 McpServerConfig 的 Map.copyOf 抛无名 NPE。
+    write(
+        """
+        servers:
+          - name: nulls
+            transport: stdio
+            command: echo
+            env:
+              TOKEN:
+        """);
+    IllegalArgumentException envEx =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(envEx.getMessage().contains("env.TOKEN"), envEx::getMessage);
+
+    write(
+        """
+        servers:
+          - name: nulls
+            transport: sse
+            url: https://example.com/mcp
+            headers:
+              Authorization:
+        """);
+    IllegalArgumentException headersEx =
+        assertThrows(
+            IllegalArgumentException.class, () -> new McpConfigLoader(configFile()).loadRaw());
+    assertTrue(headersEx.getMessage().contains("headers.Authorization"), headersEx::getMessage);
+
+    write(
+        """
+        servers:
+          - name: nulls
+            transport: stdio
+            command: echo
+            env:
+              ~: ignored
+              OK: kept
+        """);
+    List<io.oryxos.core.mcp.McpServerConfig> skipped = new McpConfigLoader(configFile()).loadRaw();
+    assertEquals(Map.of("OK", "kept"), skipped.get(0).env());
   }
 
   @Test

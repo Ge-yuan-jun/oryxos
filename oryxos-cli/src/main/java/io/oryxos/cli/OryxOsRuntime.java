@@ -314,24 +314,72 @@ public class OryxOsRuntime {
     return new JpaPricingStore(repository);
   }
 
-  /** 022：落库凭证加解密——主密钥两档解析（ORYXOS_MASTER_KEY 优先，缺省 {oryxos.root}/master.key 首启自动生成）。 */
+  /** 022：主密钥两档解析（ORYXOS_MASTER_KEY 优先，缺省 {oryxos.root}/master.key）。首启自动生成的那把先只在内存里。 */
   @Bean
-  io.oryxos.core.secret.SecretCipher secretCipher() {
-    return new io.oryxos.core.secret.LocalMasterKeyCipher(
-        new io.oryxos.core.secret.MasterKeyResolver(oryxosRoot()).resolve());
+  io.oryxos.core.secret.MasterKeyResolver masterKeyResolver() {
+    return new io.oryxos.core.secret.MasterKeyResolver(oryxosRoot());
   }
 
-  /** 022：存量明文迁移 + 密钥守卫（幂等；密钥不匹配拒启指路）。025 起表结构由 Flyway 收敛，迁移完才跑。 */
+  /** 022：落库凭证加解密（cipher 用启动期解析出的钥匙；此时它可能还没落盘，见下面的 secretMigration）。 */
+  @Bean
+  io.oryxos.core.secret.SecretCipher secretCipher(
+      io.oryxos.core.secret.MasterKeyResolver masterKeyResolver) {
+    return new io.oryxos.core.secret.LocalMasterKeyCipher(
+        masterKeyResolver.resolveForStartup().key());
+  }
+
+  /**
+   * 022：存量明文迁移 + 密钥守卫（幂等；密钥不匹配拒启指路）。025 起表结构由 Flyway 收敛，迁移完才跑。
+   *
+   * <p>顺序即契约：<b>守卫 → 首启新钥匙落盘 → 迁移明文</b>。反过来的「先落盘、再守卫」会在钥匙丢失时留下一个刚生成的、 解不开任何东西的
+   * master.key，拒启提示让运维去「找回原密钥」时，他会找到一个文件——那正是本次启动自己写的。
+   */
   @Bean
   @DependsOn("flywayInitializer")
   io.oryxos.storage.SecretMigration secretMigration(
       LlmProviderRepository providerRepository,
       NotifyChannelRepository channelRepository,
-      io.oryxos.core.secret.SecretCipher secretCipher) {
+      io.oryxos.core.secret.SecretCipher secretCipher,
+      io.oryxos.core.secret.MasterKeyResolver masterKeyResolver) {
     io.oryxos.storage.SecretMigration migration =
         new io.oryxos.storage.SecretMigration(providerRepository, channelRepository, secretCipher);
-    migration.run();
+    try {
+      migration.guard();
+    } catch (IllegalStateException refusal) {
+      // 拒绝启动时把「这次到底发生了什么」补上：钥匙是哪来的、有没有落下新文件
+      throw new IllegalStateException(
+          refusal.getMessage() + "\n" + keyRefusalAdvice(masterKeyResolver), refusal);
+    }
+    masterKeyResolver.persistIfGenerated(); // 守卫通过才落盘：首启的新钥匙此时才存在
+    migration.migratePlaintext();
     return migration;
+  }
+
+  /** 拒启时按钥匙来源补一句运维看得懂的说明（尤其别让「找回 master.key」指向本次自己生成的文件）。 */
+  private static String keyRefusalAdvice(
+      io.oryxos.core.secret.MasterKeyResolver masterKeyResolver) {
+    io.oryxos.core.secret.MasterKeyResolver.ResolvedMasterKey resolved =
+        masterKeyResolver.resolveForStartup();
+    java.nio.file.Path keyFile = masterKeyResolver.keyFile();
+    return switch (resolved.origin()) {
+      case ENV ->
+          "本次启动使用的密钥来自 "
+              + io.oryxos.core.secret.MasterKeyResolver.ENV_VAR
+              + " 环境变量，它解不开库里的密文：请确认变量值是否被更换，找回与库匹配的原密钥。";
+      case FILE -> "本次启动使用的密钥来自 " + keyFile + "：文件存在但内容与库中密文不匹配。请找回与库匹配的原密钥。";
+      case GENERATED ->
+          "本次启动 "
+              + io.oryxos.core.secret.MasterKeyResolver.ENV_VAR
+              + " 未设置、"
+              + keyFile
+              + " 也不存在，临时生成的密钥没有写入磁盘——该文件现在不存在，不要去那里找原密钥。"
+              + "若你手上有原密钥的备份，请从备份取回；不要为了重新生成而删除备份。"
+              + "恢复：从备份取回原密钥（设置 "
+              + io.oryxos.core.secret.MasterKeyResolver.ENV_VAR
+              + " 或放回 "
+              + keyFile
+              + "），或经管理台删除并重新录入凭证。";
+    };
   }
 
   /** 023：业务指标——serve 场景（actuator 在类路径且有 MeterRegistry）落 Micrometer；chat 等无监控上下文 NOOP 兜底。 */
@@ -780,6 +828,22 @@ public class OryxOsRuntime {
       ThreadPoolTaskExecutor knowledgeWatcherExecutor) {
     return new io.oryxos.knowledge.watch.KnowledgeWatcher(
         oryxosRoot(), knowledgeIndexService, knowledgeWatcherExecutor);
+  }
+
+  /**
+   * FR-010 集群档启动对账：集群档不装配 {@code KnowledgeWatcher}（NFS 上 inotify 不可靠），但「重启后的首轮对账」不能 因此缺席——被重启打断的
+   * PENDING/INDEXING 没有在飞任务，也没有别的机制把它拉回终态（手动刷新的运行中对账把 PENDING 视为在飞，不算差异），只能整库 rebuild。单机档由 watcher
+   * 的启动对账负责，两条路径各恰好一次。
+   */
+  @Bean
+  @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+      name = "oryxos.cluster.enabled",
+      havingValue = "true")
+  org.springframework.boot.ApplicationRunner clusterKnowledgeStartupReconciler(
+      io.oryxos.knowledge.index.KnowledgeIndexService knowledgeIndexService) {
+    io.oryxos.knowledge.watch.KnowledgeBaseReconciler reconciler =
+        new io.oryxos.knowledge.watch.KnowledgeBaseReconciler(knowledgeIndexService);
+    return args -> reconciler.reconcileAll(oryxosRoot().resolve("knowledge"));
   }
 
   @Bean
@@ -1873,7 +1937,11 @@ public class OryxOsRuntime {
             channelConfigLoader,
             inboundChannelRegistry,
             profileRegistry,
-            inboundChannelFactories(profileRegistry, inboundMessageService, channelOutboundGuard));
+            inboundChannelFactories(
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                nativeWorkspaceRoot()));
     // 026：集群档下独连型渠道（企微）走属主协调——持租约副本建连，属主失效自动接管，永不互踢
     if (clusterProps.isEnabled()) {
       io.oryxos.core.channel.ChannelLeaseCoordinator leaseCoordinator =
@@ -1881,6 +1949,8 @@ public class OryxOsRuntime {
               coordinationStore, clusterProps, taskScheduler);
       leaseCoordinator.setMetricsRecorder(channelMetricsRecorder);
       service.setChannelLeaseCoordinator(leaseCoordinator);
+      // 集群档要求渠道配好调用方校验：多副本生产里，裸奔的入站端点谁都能驱动 Agent 推理（#918）
+      service.setRequireCallerVerification(true);
     }
     return service;
   }
@@ -1892,16 +1962,17 @@ public class OryxOsRuntime {
       inboundChannelFactories(
           ProfileRegistry profileRegistry,
           io.oryxos.core.channel.InboundMessageService inboundMessageService,
-          io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
+          io.oryxos.core.channel.OutboundGuard channelOutboundGuard,
+          Path workspaceRoot) {
     Map<
             String,
             java.util.function.Function<
                 io.oryxos.core.channel.ChannelConfig, io.oryxos.core.channel.InboundChannelAdapter>>
         factories = new LinkedHashMap<>();
     registerEnterpriseChannelFactories(
-        factories, profileRegistry, inboundMessageService, channelOutboundGuard);
+        factories, profileRegistry, inboundMessageService, channelOutboundGuard, workspaceRoot);
     registerConsumerChannelFactories(
-        factories, profileRegistry, inboundMessageService, channelOutboundGuard);
+        factories, profileRegistry, inboundMessageService, channelOutboundGuard, workspaceRoot);
     return factories;
   }
 
@@ -1914,37 +1985,62 @@ public class OryxOsRuntime {
           factories,
       ProfileRegistry profileRegistry,
       io.oryxos.core.channel.InboundMessageService inboundMessageService,
-      io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
+      io.oryxos.core.channel.OutboundGuard channelOutboundGuard,
+      Path workspaceRoot) {
     factories.put(
         io.oryxos.channel.feishu.FeishuChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.feishu.FeishuChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.wecom.WeComChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.wecom.WeComChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.dingtalk.DingTalkChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.dingtalk.DingTalkChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.slack.SlackChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.slack.SlackChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.discord.DiscordChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.discord.DiscordChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.telegram.TelegramChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.telegram.TelegramChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
   }
 
   private static void registerConsumerChannelFactories(
@@ -1956,7 +2052,8 @@ public class OryxOsRuntime {
           factories,
       ProfileRegistry profileRegistry,
       io.oryxos.core.channel.InboundMessageService inboundMessageService,
-      io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
+      io.oryxos.core.channel.OutboundGuard channelOutboundGuard,
+      Path workspaceRoot) {
     factories.put(
         io.oryxos.channel.whatsapp.WhatsAppChannelAdapter.TYPE,
         resolved ->
@@ -1976,17 +2073,29 @@ public class OryxOsRuntime {
         io.oryxos.channel.mattermost.MattermostChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.mattermost.MattermostChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.matrix.MatrixChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.matrix.MatrixChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.qq.QqChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.qq.QqChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.douyin.DouyinChannelAdapter.TYPE,
         resolved ->
@@ -1996,12 +2105,20 @@ public class OryxOsRuntime {
         io.oryxos.channel.weixin.WeixinChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.weixin.WeixinChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.weixinkf.WeixinKfChannelAdapter.TYPE,
         resolved ->
             new io.oryxos.channel.weixinkf.WeixinKfChannelAdapter(
-                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+                resolved,
+                profileRegistry,
+                inboundMessageService,
+                channelOutboundGuard,
+                workspaceRoot));
     factories.put(
         io.oryxos.channel.weixinmp.WeixinMpChannelAdapter.TYPE,
         resolved ->
@@ -2179,11 +2296,13 @@ public class OryxOsRuntime {
   AgentExecutionService agentExecutionService(
       AgentExecutionStore agentExecutionStore,
       @Qualifier("agentExecutionExecutor") ExecutorService agentExecutionExecutor,
-      AgentRunEventPublisher agentRunEventPublisher) {
+      AgentRunEventPublisher agentRunEventPublisher,
+      io.oryxos.core.cluster.ClusterProperties clusterProperties) {
     return new AgentExecutionService(
         agentExecutionStore,
         agentExecutionExecutor,
         Clock.systemDefaultZone(),
-        agentRunEventPublisher);
+        agentRunEventPublisher,
+        clusterProperties.isEnabled());
   }
 }

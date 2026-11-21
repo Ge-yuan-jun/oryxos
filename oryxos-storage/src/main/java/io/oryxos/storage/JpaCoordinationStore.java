@@ -113,6 +113,11 @@ public class JpaCoordinationStore implements CoordinationStore {
   }
 
   @Override
+  public void unmarkReceipt(String receiptKey) {
+    receipts.deleteReceipt(receiptKey);
+  }
+
+  @Override
   public boolean tryAcquireChannel(String channelName, String owner, Duration ttl) {
     Instant now = dbNow();
     Instant until = now.plus(ttl);
@@ -182,6 +187,13 @@ public class JpaCoordinationStore implements CoordinationStore {
     instances.deleteOlderThan(now.minus(instanceDeadAfter));
   }
 
+  /**
+   * 递增工作区域版本号。SQL 在 {@link WorkspaceVersionRepository#bump}。
+   *
+   * <p>同一张 {@code workspace_versions} 表还有第二个写端：CLI 轻命令的 {@code
+   * io.oryxos.cli.command.WorkspaceVersionBump}（零 Spring，原生 JDBC，不经本类）。两处语义必须一致——改这里的 SQL/列名必须同步
+   * CLI 侧，反之亦然；{@code io.oryxos.boot.WorkspaceVersionBumpCrosscheckTest} 把两侧接到同一个库上互认， 任一侧漂移都会红。
+   */
   @Override
   public void bumpWorkspaceVersion(String domain, String owner) {
     if (!WORKSPACE_DOMAINS.contains(domain)) {
@@ -275,24 +287,10 @@ public class JpaCoordinationStore implements CoordinationStore {
 
   /**
    * 约束违规判定：PG 经 Spring 翻译为 DataIntegrityViolationException；SQLite community 方言把 SQLITE_CONSTRAINT
-   * 包成 JpaSystemException（翻译缺口，契约测试实证）——按 cause 链 SQLState 23xxx 或 SQLITE_CONSTRAINT
-   * 标识兜底。非约束违规的异常原样上抛（绝不吞真错误）。
+   * 包成 JpaSystemException（翻译缺口，契约测试实证）。识别逻辑已收敛到 {@link ConstraintViolations}， 与沙箱白名单的幂等写入共用同一份 ——
+   * 判定只放一处。非约束违规的异常原样上抛（绝不吞真错误）。
    */
   private static void rethrowUnlessConstraintViolation(DataAccessException e) {
-    for (Throwable cause = e; cause != null; cause = cause.getCause()) {
-      if (cause instanceof org.springframework.dao.DataIntegrityViolationException
-          || cause instanceof org.hibernate.exception.ConstraintViolationException) {
-        return;
-      }
-      if (cause instanceof java.sql.SQLException sql) {
-        String state = sql.getSQLState();
-        boolean integrityState = state != null && state.startsWith("23");
-        boolean sqliteConstraint = String.valueOf(sql.getMessage()).contains("SQLITE_CONSTRAINT");
-        if (integrityState || sqliteConstraint) {
-          return;
-        }
-      }
-    }
-    throw e;
+    ConstraintViolations.rethrowUnlessConstraintViolation(e);
   }
 }

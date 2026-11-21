@@ -193,7 +193,7 @@ oryxos profile show ops-agent
 
 ### profile delete
 
-Remove an agent's entire directory from the workspace.
+Archive an agent's entire directory into `<workspace>/archive/` (nothing is physically deleted).
 
 ```bash
 oryxos profile delete <name>
@@ -205,16 +205,22 @@ oryxos profile delete <name>
 
 ### provider list
 
-List the providers declared for this instance. The light CLI command reads them straight from the packaged `application.yml` (`oryxos.providers`), printing each provider's name and base URL. (At runtime, providers are managed as a dynamic registry backed by SQLite, seeded from these declarations.)
+List the provider registry this instance actually runs with. The light CLI command queries the same database as the runtime — the `providers` table in `oryxos.db` by default, or the datasource configured in `config/application.yml` — and prints each provider's name, derived default marker, base URL and description. The packaged `application.yml` only seeds providers missing from the database on first startup; after that the database is the single source of truth. Providers added or deleted in the admin console (`/api/v1/providers`) show up here accordingly.
 
 ```bash
 oryxos provider list
 ```
 
 ```text
-deepseek     https://api.deepseek.com
-qwen         https://dashscope.aliyuncs.com/compatible-mode/v1
+Provider 注册表（oryxos.db）：
+NAME                 DEFAULT  BASE-URL                                             DESCRIPTION
+deepseek             *        https://api.deepseek.com                             默认 DeepSeek
+mock                          -                                                    内置假模型
+qwen                          https://dashscope.aliyuncs.com/compatible-mode/v1    通义
+default(*) 为运行时派生（注册表内按大小写无关排序的最小名），不是库字段。
 ```
+
+The command exits non-zero when the database is unreachable, uninitialized, or missing the `providers` table; it never falls back to the packaged YAML.
 
 ### tool list
 
@@ -282,10 +288,27 @@ oryxos user list
 ```
 
 ```text
-USERNAME                ENABLED  CREATED_AT
-admin                   true     2026-07-22T10:30:00Z
-alice                   true     2026-07-22T11:00:00Z
+USERNAME                 ENABLED  ROLE             CREATED_AT
+admin                    true     VIEWER           2026-07-22T10:30:00Z
+alice                    true     EDITOR           2026-07-22T11:00:00Z
 ```
+
+The `ROLE` column (039 authorization) is the account's current role; an account holding several roles shows them comma-separated, and an empty role field shows `-`.
+
+### user role
+
+Set an account's role (039 authorization): `VIEWER` (read-only) / `EDITOR` (do work and manage assets) / `ADMIN` (manage members, channels, policies, workspace settings). They nest, and the value is case-insensitive. The command **replaces** the role — one role per invocation, never appended; an invalid role name fails with a clear error.
+
+```bash
+oryxos user role <username> <VIEWER|EDITOR|ADMIN>
+```
+
+```bash
+oryxos user role admin ADMIN
+# Role of 'admin' set to ADMIN
+```
+
+New accounts default to `VIEWER`, so doing real work requires an explicit promotion. Roles are re-resolved from the database on every request with no caching, so a change or revocation takes effect on the **very next request**. For how to turn authorization on, what each tier may do, and the permission ceiling on API keys, see the "Authorization (RBAC)" section of [Authentication](./auth.md).
 
 ### user passwd
 

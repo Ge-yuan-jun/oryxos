@@ -3,307 +3,93 @@
 </p>
 
 <p align="center">
-  <strong>Say it in plain language. A team of agents delivers.</strong><br/>
-  <em>The self-hosted Agent Operating System for the enterprise.</em>
+  <strong>Build enterprise AI applications. Govern every AI action.</strong><br/>
+  <em>An open-source, self-hosted Agent Harness OS for the enterprise.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/oryx-labs/oryxos/releases"><img src="https://img.shields.io/badge/version-0.1.6-orange?style=flat-square" alt="version"/></a>
+  <a href="https://github.com/oryx-labs/oryxos/releases"><img src="https://img.shields.io/badge/version-0.1.9-orange?style=flat-square" alt="version"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-native-8A2BE2?style=flat-square" alt="MCP native"/></a>
   <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="Apache 2.0"/></a>
 </p>
 
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
+</p>
+
 ---
 
-**OryxOS is the self-hosted Agent OS for the enterprise.** Describe a task in one sentence of natural language — OryxOS breaks it down, assembles a team of agents, and they collaborate to deliver the result:
+**OryxOS is an open-source, self-hosted Agent Harness OS for enterprise AI applications.** It lets enterprises run any Agent inside controlled context, execution environments, Tools, permissions, acceptance criteria, and governance. Build R&amp;D automation, knowledge support, ticket collaboration, operations diagnostics, and other domain applications on one shared runtime.
 
-<p align="center">
-  <img src="website/public/images/pipeline-en.svg" alt="one sentence → decompose → assemble an agent team → collaborate → deliver the result" width="100%"/>
-</p>
+## What is OryxOS
 
-**So every company can run its own agents — in plain language.** No code to define an agent, no data leaving your infrastructure, every step audited.
+OryxOS is the operating foundation for enterprise AI applications. Its direction is to give enterprises one place to **build, run, govern, and optimize** their own AI applications. Application teams compose Agents, models, Knowledge, Tools, MCP servers, and Flows to solve business problems; OryxOS supplies the execution semantics that make those applications consistent, extensible, and operable across the organization.
 
-- **Today, shipped**: define an agent in one sentence (or one markdown directory) and it goes live instantly — with memory, 24 built-in tools, MCP connectors, skills, notifications, and cron scheduling, all on your own servers.
-- **The north star**: publish a task in one sentence and an agent *team* self-organizes to deliver it — planner, specialists, reviewer — fully audited, with humans approving the dangerous steps. See the [roadmap](docs/VisionAndRoadmap.md).
+**Agent Harness OS** describes the shared Runtime and governance semantics around every Agent and Task. Agents are replaceable executors; the enterprise Harness — its context, environment, capabilities, policies, evidence, and operational feedback — is the asset that compounds.
 
-> Long-term vision: enter the Apache Software Foundation as a top-level project.
+Its core principle is simple: applications can freely compose capabilities, but they cannot bypass governance. Every Task runs through a common path for identity, authorization, policy, approval, model routing, Tool execution, audit, trace, cost attribution, and state updates.
 
-## The Agent formula
-
-Everything an agent needs is **built into the OS** — an agent just references what it wants:
-
-<p align="center">
-  <img src="website/public/images/agent-formula-en.svg" alt="natural language (md) + Memory + Tools + MCP + Skills + Knowledge + Notify = a working Agent" width="100%"/>
-</p>
-
-This is the whole point: **drive the cost of defining an agent toward zero.** You write intent; the OS supplies the capabilities, the safety rails, and the audit trail.
-
-## What is an agent harness (and why an OS)
-
-**An agent harness is the scaffolding around a model that turns it into a working agent:** the loop that drives reason → act → observe, the tools it can call and the execution that runs them, the context assembled before every call, the memory it accumulates, the sandbox that contains it, and the audit trail that records what it did. A bare model only generates text — the harness is what lets it *do* things, reliably and safely.
-
-**The bottleneck for reliable agents in production is not the model — it's the harness around it.** And an enterprise never runs just one agent. OryxOS gives every agent the same production-grade harness, and runs the whole fleet like an operating system runs processes — that's the **Agent Harness OS**.
-
-## Model → Harness → OS
-
-| | Bare Model | Agent Harness | Agent Harness OS |
-| --- | --- | --- | --- |
-| Scope | A single LLM call | **One** reliable agent | A **fleet** of agents |
-| Provides | Text generation | Loop, tools + execution, context, memory, sandbox, audit, delivery | Lifecycle, channels, routing, shared registries, scheduling, governance, admin + API |
-| Analogy | A CPU instruction | A process with its runtime | An OS running many processes |
-
-OryxOS is the third column — and it ships the second one for every agent it runs.
-
-## Features
-
-**🤖 One Directory = One Agent**
-An Agent is a directory: `.oryxos/agents/<name>/AGENT.md` — YAML frontmatter plus task instructions. Its optional `skills/` directory contains relative symlinks to shared Skill entities. Every prompt receives only each bound Skill's name, description, and local path; bodies and resources load on demand. Multiple agents co-exist on one instance.
-
-**⚡ Dynamic Agent Management**
-Create an agent via REST, generate a draft `AGENT.md` from one sentence with an LLM, or update its workspace directory during a maintenance window. Single-node mode uses `WorkspaceWatcher`; cluster mode uses version polling and periodic reconciliation to reload definitions without restarting.
-
-**📦 One Binary, Zero Ceremony**
-A single executable artifact with a self-implemented, fully inspectable ReAct loop and synchronous execution on virtual threads. `bin/oryx-server start` and you're live — REST API, web console, scheduler, and sandbox in one process. No extra runtimes, no sidecars.
-
-**🔒 Private & Compliant**
-Runs on your own K8s, VM, or bare metal. Data never leaves your environment. No cloud lock-in. Credentials go through environment variables and your enterprise key management.
-
-**🔀 Dynamic Provider Registry**
-LLM providers and notify channels are stored in SQLite with full CRUD — add, edit, or remove them at runtime. Explicit `name → ChatModel` routing is preserved; the model is rebuilt and cached when its key or base URL changes.
-
-**🛡️ Security as Foundation**
-Tool calls pass through file-path, command, and domain whitelists. Full audit trail from day one — every tool invocation and LLM call is persisted to the audit tables, not just logged.
-
-**🔌 Open Standards**
-Tools via MCP with a three-tier plugin model (zero-code SKILL.md → custom MCP server → native `@Tool`). Notify channels addressed by name. Agent-to-agent collaboration via A2A on the roadmap.
+```text
+Task → Context / Environment → Identity / Authorization → Policy / Approval
+     → Model / Tool Execution → Artifact / Evidence → Audit / Trace / Cost → State Update
+```
 
 ## Architecture
 
 <p align="center">
-  <img src="website/public/images/architecture.svg" alt="OryxOS Architecture" width="100%"/>
+  <img src="website/public/images/oryxos-overview-en.svg" alt="OryxOS architecture overview" width="100%"/>
 </p>
 
-## Five Core Capabilities
+OryxOS is the shared foundation beneath enterprise AI applications: a stable kernel with extensible capabilities and a governance path that remains part of execution.
 
-| Capability | Description |
+## Core platform capabilities
+
+| Capability | What it provides |
 | --- | --- |
-| **LLM Routing** | Dynamic, SQLite-backed provider registry with CRUD. Agents are provider-agnostic; explicit name → model routing keeps multi-provider dispatch correct. Switch or add providers at runtime. Local inference supported. |
-| **ReAct Loop** | Self-implemented reasoning engine — no external framework. LLM decides whether and which tool to call; OryxOS executes, feeds the result back; LLM decides the next step. Synchronous execution on virtual threads; loop fully controllable. |
-| **Memory** | Per-agent long-term memory (`.oryxos/agents/<name>/MEMORY.md`, timestamped entries; global fallback when no agent context). Auto-injected into every system prompt. Recall upgrades to semantic three-route retrieval (vector + keyword + recency, weighted RRF) once `embedding.*` is configured; pluggable backends incl. self-hosted mem0. |
-| **Knowledge** | Named knowledge bases (`.oryxos/knowledge/<name>/`) with chunking + embedding indexing (md / txt / text-layer PDF), hybrid retrieval (vector + keyword, RRF fusion) behind a pluggable backend contract; agents bind via symlinks and retrieve with mandatory citations (`retrieve_knowledge`), hot-reload + admin console lifecycle + usage dashboard included. |
-| **Tool System** | Built-in file, shell, and HTTP tools. Three-tier extension: zero-code SKILL.md + community MCP server → light-code custom MCP server → heavy-code native `@Tool` method. |
-| **REST API** | All capabilities exposed via REST. Any language can integrate. Business systems connect via HTTP. |
+| **Agent and Task Runtime** | A consistent lifecycle for Agent execution, context, controlled environments, sessions, memory, state, artifacts, evidence, and durable work. |
+| **Model routing and cost optimization** | Selects models according to task requirements such as quality, latency, availability, cost, and data boundaries; evolves toward fallback, budgets, quotas, and organization-wide optimization. |
+| **Knowledge and context** | Knowledge bases, retrieval, long-term memory, and extensible context assembly for business applications. |
+| **Tools, MCP, and enterprise integrations** | Reusable capabilities for acting on enterprise systems through built-in Tools, MCP servers, Skills, channels, and custom extensions. |
+| **Governance Runtime** | Identity, authorization, policy, approval, sandbox boundaries, and audit are part of the action path rather than after-the-fact reporting. |
+| **Operations and reliability** | Traceability, acceptance evidence, cost attribution, evaluation, recovery, retries, observability, and the foundation for dependable production operation. |
+
+## Why it matters
+
+- **Build business applications, not infrastructure.** Teams focus on their domain while reusing a common AI runtime, execution environment, and capability layer.
+- **Govern every AI action.** Models and Tools can be composed by applications, but policy, approval, audit, and security boundaries travel with execution.
+- **Optimize as a system.** Routing, cost, evidence, trace, evaluation, and operational data become shared enterprise assets rather than isolated application concerns.
 
 ## Roadmap
 
-**Phase 1 — Single-node Runtime Kernel** ✅ *(shipped)*
-Define an agent in one sentence or one directory; it goes live with no restart. Memory, 24 built-in tools, MCP, skills, notify, cron, sandbox, full audit, REST API, and a web console — all working on a single node.
+**Available today — single-node runtime kernel**
 
-**Next — parallel tracks, pick one and start** *(see [Vision & Roadmap](docs/VisionAndRoadmap.md))*
+Define and run Agents on your infrastructure with model Providers, Memory, Knowledge, built-in Tools, MCP, Skills, notifications, scheduling, sandbox controls, audit records, REST APIs, and a Web Manager.
 
-- **A · Distributed foundation** — pluggable storage (SQLite → MySQL/PostgreSQL), stateless instances, DB-based cluster scheduling (xxl-job style)
-- **B · Knowledge & memory** — built-in knowledge base + semantic memory on a shared vector subsystem
-- **C · Flow orchestration** — declarative markdown flows, sub-agent delegation, A2A protocol
-- **D · Self-improving agents** — auto-distill skills from successful runs
-- **E · Omni-channel & multimodal** — Feishu / WeCom / DingTalk / Slack / Telegram, voice, browser, vision
-- **F · Container-grade sandboxing** — Docker / SSH execution backends
-- **G · Enterprise governance** — multi-tenancy, SSO/RBAC, cost dashboards, capability marketplace
-- **H · Enterprise-only powers** — human-in-the-loop approval, audit-to-data-flywheel, cost governance, smart model routing
-- **I · The north star** — publish a task in one sentence; an agent team self-organizes and delivers the result
+**Evolving — enterprise execution foundation**
 
-## Module Structure
+- **Durable Tasks** — stable lifecycle, checkpoints, artifacts, waiting, cancellation, retry, and recovery.
+- **Model routing and cost optimization** — policy-aware routing, fallback, budgets, quotas, usage attribution, and data-boundary controls.
+- **Governance Control Plane** — identity context, policy distribution, approval workflows, organization boundaries, and administrative lifecycle.
+- **Operational intelligence** — cost analysis, trace analysis, evaluation, regression feedback, and cross-application optimization.
+- **Distributed foundation and Flows** — shared storage, stateless instances, high availability, and governed workflow execution.
 
-```text
-oryxos/
-├── oryxos-core          # OryxTool, Session, ReActLoop, PromptBuilder, ToolExecutor, AgentScheduler
-├── oryxos-provider      # ProviderService, Function Calling adapter, explicit multi-provider map
-├── oryxos-memory        # MemoryService, LongTermMemory, MemoryTools (save/recall)
-├── oryxos-knowledge     # Knowledge base: local backend plugin, chunk/embed/index pipeline,
-│                        #   hybrid retrieval (vector + keyword + RRF), retrieve_knowledge
-├── oryxos-tool          # Built-in tools (file/shell/http), MCP Client, ToolRegistry, SandboxChecker
-├── oryxos-channel-cli   # CLI channel: oryxos chat implementation
-├── oryxos-web           # REST API controllers, Web admin console, GlobalExceptionHandler
-├── oryxos-storage       # SQLite, SessionRepository, ToolInvocationRepository, LlmCallRepository
-├── oryxos-cli           # Picocli entry, 12 subcommands, ConfigLoader
-└── oryxos-boot          # Spring Boot main class, auto-configuration, dependency aggregation
-```
+See the [Vision & Roadmap](docs/VisionAndRoadmap.md) for the evolving technical plan.
 
-Modules are decoupled through interfaces. Adding a new Channel or Tool requires only a new module — `oryxos-core` stays untouched.
-
-## Quick Start
-
-**Prerequisites**: Java 21, Maven 3.9+, and an LLM API key (DeepSeek / Qwen / OpenAI / Ollama). The Maven build installs a local Node.js on first run to bundle the admin UI — no global Node.js required.
-
-**Windows**: Built-in workspace storage requires a native POSIX filesystem, so start the server inside WSL2 (Ubuntu). Clone into the Linux home directory, for example `~/oryxos`, then build and run there. A checkout on a Windows drive such as `/mnt/d/...` is still NTFS and fails the same startup check. Docker on WSL2 is the other supported path.
-
-### 1 · Build
+## Quick start
 
 ```bash
 git clone https://github.com/oryx-labs/oryxos.git
 cd oryxos
-mvn package -DskipTests          # compiles all modules + bundles the Vue admin UI into the fat JAR
+mvn package -DskipTests
+bin/start.sh
 ```
 
-### 2 · Configure the LLM key
+The default setup starts with the built-in `mock` Provider and does not require an LLM API key. Open `http://localhost:8080/admin/` after startup.
 
-```bash
-cp config/application.yml.example config/application.yml
-# edit config/application.yml → fill in the deepseek api-key
-```
+For installation, deployment, provider configuration, API references, and development instructions, see [docs](docs/).
 
-`config/application.yml` is gitignored, so your key stays local and is never committed. Only **one** provider key is needed to boot — Spring AI's eager OpenAI auto-config is excluded, so `serve` starts without `spring.ai.openai.api-key`.
+## Project
 
-### 3 · One-click start — server + manager
-
-```bash
-bin/start.sh                     # defaults to port 8080; or: bin/start.sh 9000
-bin/stop.sh                      # stop
-```
-
-`start.sh` launches a single process that serves **both** the REST API and the Web Manager on the same port, waits for the health check to pass, then prints the URLs (`/api/v1/health`, `/admin/`, `/swagger-ui`). Logs stream to `logs/oryxos.log`. On the first run it creates `config/application.yml` from the template and asks you to fill in the key.
-
-### CLI alternative
-
-```bash
-JAR=oryxos-boot/target/oryxos-boot-*.jar
-java -jar $JAR init                       # initialize the .oryxos/ workspace (agents/ memory/ sessions/ logs/)
-export DEEPSEEK_API_KEY=your-key-here      # the CLI reads the key from the environment
-java -jar $JAR chat --profile default      # interactive multi-turn chat
-java -jar $JAR serve --port 8080           # REST API + Web Manager (same as start.sh)
-```
-
-The workspace defaults to `.oryxos/` but is configurable — set `ORYXOS_ROOT` (or `-Doryxos.root=`, or `oryxos.root` in `application.yml`) to point OryxOS at a custom workspace directory. The selected workspace root and its checked native execution view are auto-added to the file sandbox whitelist. Shared deployments use the `shared-posix` provider with a pre-provisioned `.workspace-id`; see the [shared workspace guide](docs/SharedVolumeGuide.md) for plugin requirements, conflict handling, output isolation and recovery.
-
-### Docker alternative
-
-Every release also ships a multi-arch container image (`linux/amd64` + `linux/arm64`) on GHCR — no Java 21 install, no tarball download:
-
-```bash
-docker run -d --name oryxos -p 8080:8080 -v oryxos-data:/data ghcr.io/oryx-labs/oryxos:latest
-curl http://localhost:8080/api/v1/health      # → {"code":0,…}
-```
-
-The container boots keyless (configure providers in the web console afterwards) and keeps **all state** — `config/`, the `.oryxos/` workspace, `oryxos.db`, logs — in the `/data` volume, so upgrading means pulling a new tag and recreating the container. The image runs as a non-root user and carries a built-in healthcheck against `/api/v1/health`; see `docker-compose.yml` at the repo root for a ready-to-use compose stack. To build the image locally from source: `make docker` (after `make build`).
-
-> The example above uses default SQLite — run **one** container. Multi-replica deployments require shared PostgreSQL and a shared workspace. See the [K8s deployment guide](docs/K8sDeployGuide.md) and [shared-volume requirements](docs/SharedVolumeGuide.md). Local kind validation does not establish cross-host storage HA; the [042 acceptance record](specs/042-workspace-storage/acceptance.md) keeps that verification pending.
-
-### Web Service & Web Manager
-
-`serve` (and `bin/start.sh`) exposes one process with two faces on the same port:
-
-| URL | What |
-| --- | --- |
-| `http://localhost:8080/api/v1/**` | REST API (see below) |
-| `http://localhost:8080/admin/` | **Web Manager** — Vue 3 console |
-| `http://localhost:8080/swagger-ui` | OpenAPI docs |
-
-The Web Manager is a Vue 3 + Vite console (same stack and dark-orange theme as the site) with pages for **agent management** (create, one-sentence LLM generation, file editor, per-agent session and memory views), **provider and notify-channel CRUD**, **scheduled tasks**, **sessions, tools, sandbox whitelist**, and a **workspace file browser**. It is built to `oryxos-web/src/main/resources/static/admin/` and served by Spring at `/admin`, so the fat JAR ships it — no separate frontend process.
-
-<p align="center">
-  <img src="website/public/images/manager.jpg" alt="OryxOS Web Manager console" width="100%"/>
-</p>
-
-#### Manager dev mode (hot reload)
-
-When iterating on the console UI, run the Vite dev server instead of rebuilding the JAR each time — it hot-reloads on save and bypasses the browser cache:
-
-```bash
-# 1. Keep the backend running — the dev server proxies the API to it
-bin/start.sh                              # REST API on :8080
-
-# 2. In another terminal, start the Vite dev server
-cd oryxos-web/src/main/frontend
-npm install                               # first time only
-npm run dev                               # → http://localhost:5173/admin/
-```
-
-The dev server runs on port **5173** with base `/admin/` and proxies `/api` → `localhost:8080` (see `vite.config.js`). Edit any file under `src/` and the page updates instantly. When finished, `npm run build` bundles the production assets into `static/admin/` so the next `mvn package` ships them in the fat JAR.
-
-## Agent Definition
-
-**One directory = one Agent.** Each agent lives in `.oryxos/agents/<name>/` with an `AGENT.md`, optional scripts/references, and a `skills/` binding view. Shared Skill entities live under `.oryxos/skills/<name>/`; an Agent binds one through a relative symlink at `agents/<agent>/skills/<name>`. Each prompt receives only bound Skill names, descriptions, and local paths. Bodies and resources load on demand through `read_file` / `shell`; there is no `use_skill` tool or `.oryxos/profiles/` directory.
-
-```markdown
----
-name: ops-agent
-description: DevOps assistant
-identity:
-  agent_name: ops-agent
-  prompt: You are a professional DevOps assistant...
-provider:
-  name: deepseek          # Switch to qwen / ollama / openai — zero code change
-  model: deepseek-chat
-  api_key: ${DEEPSEEK_API_KEY}
-tools:
-  - shell
-  - read_file
-  - http_get
-  - save_memory
-  - recall_memory
-schedules:
-  - key: daily-brief
-    name: Daily brief
-    cron: "0 0 9 * * *"
-settings:
-  max_iterations: 10
-  max_history_turns: 20
----
-
-You are a professional DevOps assistant. When triggered, ... (task instructions)
-```
-
-In single-node mode, `WorkspaceWatcher` registers workspace changes without restarting. In cluster mode, use the management API; direct file changes require a stopped-writer maintenance window and are picked up by periodic reconciliation. Agents can also be created via `POST /api/v1/agents` or drafted from one sentence via the admin console.
-
-## REST API
-
-All endpoints are prefixed with `/api/v1` and every response is wrapped in a unified envelope: `{ "code": 0, "message": "success", "data": <payload>, "timestamp": ... }` (non-zero `code` on error). Authentication is configurable and disabled by default; configure web authentication, API keys and authorization for your deployment before exposing protected operations.
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `POST` `GET` | `/agents`, `/agents/{name}` | Agent CRUD (create / list / get / `PUT` update / `DELETE` archive) |
-| `POST` | `/agents/{name}/invoke` | Stateless single-turn invocation |
-| `GET` | `/agents/{name}/memory` | This agent's long-term memory |
-| `GET` `POST` | `/agents/{name}/session`, `/agents/{name}/session/messages` | Console session + send message |
-| `POST` | `/agents/{name}/generate-files` | One sentence → LLM-drafted `AGENT.md` (preview only) |
-| `POST` | `/agents/{name}/files` | Save edited agent files |
-| `POST` `GET` | `/providers`, `/providers/{name}` | Provider CRUD (create / list / get / `PUT` / `DELETE`) |
-| `POST` `GET` | `/notify-channels`, `/notify-channels/{name}` | Notify-channel CRUD |
-| `POST` `GET` | `/sessions`, `/sessions/{id}` | Session create / list / history / `DELETE` archive |
-| `POST` | `/sessions/{id}/messages` | Send a message (triggers ReAct Loop) |
-| `GET` `POST` `PUT` | `/schedules`, `/schedules/{id}/executions`, `/schedules/{id}/run`, `/schedules/{id}` | List / history / run-now / enable-disable |
-| `GET` `POST` `DELETE` | `/sandbox/whitelist`, `/sandbox/whitelist/{category}` | List / add / remove sandbox entries (`FILE`\|`SHELL`\|`HTTP`) |
-| `GET` `POST` | `/workspace/tree`, `/workspace/file` | Workspace file browser (read tree / read / write file) |
-| `GET` | `/profiles` | List derived profiles (one per agent) |
-| `GET` | `/tools` | List available tools |
-| `GET` | `/health`, `/info` | Health check / runtime info + provider status |
-
-## Design Principles
-
-- **Platform before Agent** — the most important deliverable is not a powerful Agent, but the environment that lets any Agent run reliably
-- **Self-implement the core** — reasoning loop is self-implemented; protocol adapters reuse mature libraries; no reinventing the wheel
-- **One directory = one Agent** — `AGENT.md` + Agent-local Skill symlinks + optional scripts, not code
-- **Open standards** — MCP for tools, A2A for collaboration, open formats for skills
-- **Stateless instances** — state externalized from the start; the prerequisite for scaling to distributed
-- **Security as foundation** — controlled tool sources, least privilege, mandatory sandbox, encrypted storage for managed secrets, audit trails
-- **Phased and disciplined** — build the minimal complete runtime kernel first; every architecture upgrade is proven by real usage data
-
-## Tech Stack
-
-| Component | Choice |
-| --- | --- |
-| Language / Runtime | Java 21 (virtual threads) |
-| Framework | Spring Boot 3.x |
-| LLM Integration | Spring AI (OpenAI-compatible protocol translation + `@Tool` schema only) |
-| CLI | Picocli |
-| Config | SnakeYAML |
-| Persistence | SQLite (default) / PostgreSQL (cluster), Spring Data JPA; pluggable local/shared POSIX workspace |
-| Logging | Logback + SLF4J (structured JSON) |
-| Build | Maven multi-module |
-
-## Contributing
-
-First PRs are welcome — see the [Contributing Guide](https://oryxos.robustmq.com/docs/contributing) and the [GitHub workflow primer](https://oryxos.robustmq.com/docs/github-workflow).
-
-## License
-
-[Apache License 2.0](LICENSE) · [oryx-labs](https://github.com/oryx-labs) · Goal: Apache Software Foundation top-level project
+- License: [Apache License 2.0](LICENSE)
+- Contribution: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Long-term aspiration: grow an open community and pursue incubation at the Apache Software Foundation.

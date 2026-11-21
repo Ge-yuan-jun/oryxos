@@ -9,7 +9,7 @@
 > **`docs/ObservabilityModel.md`**（#470），未来 Flow/审批/子任务 span 的挂接规约亦在其中预留。
 >
 > **进展（2026-09-20）**：#472 评测薄刀落地——`io.oryxos.core.eval` fixture 评分（成功率/工具正确率/引用质量/时延/成本）、
-> 基线对比与默认关闭的回归门禁（`oryxos.eval.gate-enabled`，CI 见 `scripts/eval-regression-gate.sh` / specs/048）。
+> 基线对比与回归门禁（由 `scripts/eval-regression-gate.sh` 跑 Surefire 用例执行，阈值在代码里显式传入；`oryxos.eval.*` 目前没有运行时消费者）。
 
 ## 目标
 
@@ -26,12 +26,14 @@
 | 基础 | 现状 | 缺口 |
 |------|------|------|
 | 审计表 `llm_calls`/`tool_invocations` | Day One 已有完整原始数据（provider/model/token/耗时/成败） | 两张表**无 `llm_call_id` 关联**，拼不出 trace 树 |
-| [AuditTraceLink.md](AuditTraceLink.md) 方案 | 已设计「工具调用关联到 LLM 调用」的 `llm_call_id` 传递链路 | 尚未实现 |
+| AuditTraceLink 方案 | 已设计「工具调用关联到 LLM 调用」的 `llm_call_id` 传递链路 | 未按此实现，已改道（见「关键前置」）：库内只做扁平时间线，trace 树由 OTel 承担 |
 | 016 审计看板 | 成本/调用量/成功率的聚合看板 | 只到聚合，不到 trace 级 |
 
 ## 关键前置
 
-- **`llm_call_id` 关联**（[AuditTraceLink.md](AuditTraceLink.md)）：让 `tool_invocations` 知道自己由哪次 `llm_call` 触发，是拼 trace 树的硬前提。
+> **本节前置已不适用**（2026-09-15 起）：`llm_call_id` 方案最终没有落地，库内 trace 还原改走同 traceId 的扁平时间线（`GET /api/v1/audit/trace/{id}`，021），树形父子改由 OTel span 承担（039 / #486）。当前契约见 [ObservabilityModel.md](ObservabilityModel.md)。原方案文档 `AuditTraceLink.md` 从未落库（仓库历史中不存在）。
+
+- **`llm_call_id` 关联**（原 `AuditTraceLink.md` 方案）：让 `tool_invocations` 知道自己由哪次 `llm_call` 触发，是拼 trace 树的硬前提。
 - 可能还需：`ProviderResponse` 携带 `llmCallId`、`ToolExecutor.execute` 透传、`LlmCallAuditor.record` 返回 id。
 
 ## 模块建议

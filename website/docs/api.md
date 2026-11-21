@@ -299,7 +299,7 @@ Saves a (possibly user-edited) set of Agent files. Saving takes effect immediate
 
 Providers are managed **dynamically** and stored in SQLite (the `providers` table). At runtime the `ChatModel` is resolved by provider name from the registry and cached by `(name | apiKey | baseUrl)`, so editing a key or URL rebuilds the model on the next call. The name `mock` is a built-in fake model that needs no key or URL. The `oryxos.providers[]` entries in `application.yml` are **seeded** into the table on startup only when absent — after that the DB is authoritative.
 
-> The `apiKey` is returned in **plaintext** by design (core-phase internal-network deployment).
+> Provider keys are encrypted at rest. Provider API responses return a masked `apiKey`; they never reveal the stored credential.
 
 ### Create a provider
 
@@ -321,7 +321,7 @@ Providers are managed **dynamically** and stored in SQLite (the `providers` tabl
 // data — ProviderView
 {
   "name": "deepseek",
-  "apiKey": "sk-xxxxxxxx",
+  "apiKey": "****xxxx",
   "baseUrl": "https://api.deepseek.com",
   "description": "DeepSeek chat"
 }
@@ -334,7 +334,7 @@ Providers are managed **dynamically** and stored in SQLite (the `providers` tabl
 ```json
 // data — ProviderView[]
 [
-  { "name": "deepseek", "apiKey": "sk-xxxxxxxx", "baseUrl": "https://api.deepseek.com", "description": "DeepSeek chat" },
+  { "name": "deepseek", "apiKey": "****xxxx", "baseUrl": "https://api.deepseek.com", "description": "DeepSeek chat" },
   { "name": "mock",     "apiKey": null,          "baseUrl": null,                       "description": "built-in fake model" }
 ]
 ```
@@ -347,7 +347,7 @@ Returns `404` if the provider does not exist.
 
 ```json
 // data — ProviderView
-{ "name": "deepseek", "apiKey": "sk-xxxxxxxx", "baseUrl": "https://api.deepseek.com", "description": "DeepSeek chat" }
+{ "name": "deepseek", "apiKey": "****xxxx", "baseUrl": "https://api.deepseek.com", "description": "DeepSeek chat" }
 ```
 
 ### Update a provider
@@ -363,7 +363,7 @@ The name stays in the path; this updates the key / URL / description.
 
 ```json
 // data — ProviderView
-{ "name": "deepseek", "apiKey": "sk-yyyyyyyy", "baseUrl": "https://api.deepseek.com", "description": "rotated key" }
+{ "name": "deepseek", "apiKey": "****yyyy", "baseUrl": "https://api.deepseek.com", "description": "rotated key" }
 ```
 
 ### Delete a provider
@@ -379,7 +379,7 @@ null
 
 ## Notify channels
 
-Notify channels are managed dynamically and stored in SQLite (the `notify_channels` table). Password-like sensitive keys in `config` (`password/secret/token/api_key`, etc.) are stored encrypted (022, `enc:v1:` prefix); query endpoints echo them only as masks (`****` + last 4 chars), and submitting the mask unchanged (or blank) on edit keeps the original value — same interaction as the provider api-key. The `notify` tool references a channel **by name** in natural language inside an `AGENT.md` body (e.g. "发到 team-lark"); the tool resolves the registered channel to its adapter and URL. There is no `notify_channels` field in the AGENT.md frontmatter.
+Notify channels are managed dynamically and stored in SQLite (the `notify_channels` table). Password-like sensitive keys in `config` (`password/secret/token/api_key`, etc.) and the channel `url` (`notify_channels.url` — a webhook URL is itself a credential; the email channel's descriptive URL stays plaintext) are stored encrypted (022, `enc:v1:` prefix); query endpoints echo them only as masks (`****` + last 4 chars), and submitting the mask unchanged (or blank) on edit keeps the original value — same interaction as the provider api-key. The `notify` tool references a channel **by name** in natural language inside an `AGENT.md` body (e.g. "发到 team-lark"); the tool resolves the registered channel to its adapter and URL. There is no `notify_channels` field in the AGENT.md frontmatter.
 
 `type` is one of `feishu` | `wecom` | `dingtalk` | `webhook` (each backed by an adapter).
 
@@ -822,7 +822,7 @@ On the timeline, a TOOL step's `inputSummary`/`resultSummary`/`errorMessage` are
 
 ## Workspace file browser
 
-A read-only directory tree plus per-file read/write over the workspace (`agents/` and `archive/`). All paths are relative to the workspace root; a path that escapes the root (path traversal) returns `400`.
+A read-only directory tree plus per-file read/write over the workspace. The tree lists `agents/`, `skills/`, `output/` and `archive/` (a custom `readable-roots` makes the tree follow that setting; with the default configuration it stays these four); reads are allowed only under the configured readable roots (these four by default) and writes only under the configured writable roots (`agents/`, `output/` and `archive/` by default; `skills/` is a read-only view). All paths are relative to the workspace root; a path that escapes the root (path traversal), or one that is inside the root but outside the allowed roots, returns `400`. Both sets can be overridden with `oryxos.web.workspace.readable-roots` / `writable-roots` (comma-separated single-segment names of letters, digits, `_` and `-`; invalid values refuse startup, non-default values log a WARN at startup).
 
 ### Directory tree
 
@@ -853,7 +853,7 @@ The root node is named after the workspace directory.
 
 **GET** `/api/v1/workspace/file?path=agents/ops-agent/AGENT.md`
 
-Returns the file content as a string. A path outside the root returns `400`.
+Returns the file content as a string. A path outside the root, or one inside the root but outside a readable root, returns `400`.
 
 ```json
 // data — the file text
@@ -864,7 +864,7 @@ Returns the file content as a string. A path outside the root returns `400`.
 
 **POST** `/api/v1/workspace/file`
 
-Same path guard as reading.
+Same path guard as reading, applied to the writable roots (`agents/`, `output/`, `archive/` by default; `skills/` is a read-only view).
 
 ```json
 // request — WriteFileRequest

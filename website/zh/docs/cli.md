@@ -152,7 +152,7 @@ oryxos profile show <name>
 
 ### oryxos profile delete
 
-删除指定 Agent 的整个目录。
+删除指定 Agent：整个目录（含 `MEMORY.md`）归档到 `<root>/archive/`，不物理删除。
 
 ```bash
 oryxos profile delete <name>
@@ -162,7 +162,7 @@ oryxos profile delete <name>
 
 ### oryxos provider list
 
-列出本实例声明的 Provider。轻命令直接从打包的 `application.yml`（`oryxos.providers` 段）读取，打印每个 Provider 的名字和 base URL。（运行时 Provider 由 SQLite 支撑的动态注册表管理，启动时以这些声明为种子。）
+列出本实例实际运行所用的 Provider 注册表。轻命令查的是运行时同一个库——默认 `oryxos.db` 里的 `providers` 表，或 `config/application.yml` 配置的外部数据源——打印每个 Provider 的名字、派生默认标记、base URL 与描述。打包的 `application.yml` 只在服务首次启动时为数据库缺失的条目播种；之后数据库是唯一事实源，管理台（`/api/v1/providers`）的新增/删除在这里立即反映。
 
 ```bash
 oryxos provider list
@@ -171,9 +171,15 @@ oryxos provider list
 示例输出：
 
 ```text
-deepseek     https://api.deepseek.com
-qwen         https://dashscope.aliyuncs.com/compatible-mode/v1
+Provider 注册表（oryxos.db）：
+NAME                 DEFAULT  BASE-URL                                             DESCRIPTION
+deepseek             *        https://api.deepseek.com                             默认 DeepSeek
+mock                          -                                                    内置假模型
+qwen                          https://dashscope.aliyuncs.com/compatible-mode/v1    通义
+default(*) 为运行时派生（注册表内按大小写无关排序的最小名），不是库字段。
 ```
+
+数据库不可达 / 未初始化 / 缺 `providers` 表时命令非零退出，不会回落到打包 YAML。
 
 ### oryxos tool list
 
@@ -238,10 +244,27 @@ oryxos user list
 ```
 
 ```text
-USERNAME                ENABLED  CREATED_AT
-admin                   true     2026-07-22T10:30:00Z
-alice                   true     2026-07-22T11:00:00Z
+USERNAME                 ENABLED  ROLE             CREATED_AT
+admin                    true     VIEWER           2026-07-22T10:30:00Z
+alice                    true     EDITOR           2026-07-22T11:00:00Z
 ```
+
+`ROLE` 列（039 授权）是账号当前角色;一个账号多角色时以逗号分隔,角色字段为空显示 `-`。
+
+### oryxos user role
+
+设置账号角色（039 资源授权）:`VIEWER`（只读）/ `EDITOR`（干活与管资产）/ `ADMIN`（管成员、渠道、策略、工作区设置）,逐级包含,大小写不敏感。**覆盖式**——每次设一个角色,不是追加;非法角色名清晰报错。
+
+```bash
+oryxos user role <用户名> <VIEWER|EDITOR|ADMIN>
+```
+
+```bash
+oryxos user role admin ADMIN
+# Role of 'admin' set to ADMIN
+```
+
+新建账号默认 `VIEWER`,要干活须显式提档;角色每请求从库重解析、不缓存,改档或撤权在**下一次请求即生效**。如何开启授权、三档各自的边界、以及 API Key 主体的权限上限,见[认证](./auth.md)页的「授权（RBAC）」一节。
 
 ### oryxos user passwd
 

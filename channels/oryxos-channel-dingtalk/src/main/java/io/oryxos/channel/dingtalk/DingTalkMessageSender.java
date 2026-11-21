@@ -1,0 +1,278 @@
+package io.oryxos.channel.dingtalk;
+
+import com.fasterxml.jackson.core.JacksonException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.oryxos.core.channel.OutboundGuard;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 钉钉机器人回复：经入站消息携带的 {@code sessionWebhook} POST markdown（对齐企微出站）；出站前过 {@link OutboundGuard}。
+ *
+ * <p>群聊 B4：{@code replyToMessageId} 非空时附带 {@code at.atUserIds} 引用提问者（会话内可对应）。
+ */
+public class DingTalkMessageSender {
+
+  static final int DEFAULT_CHUNK_SIZE = 3500;
+  static final String SESSION_WEBHOOK_PREFIX = "https://oapi.dingtalk.com";
+  static final String MSG_TYPE_MARKDOWN = "markdown";
+  static final String DEFAULT_MARKDOWN_TITLE = "OryxOS";
+  private static final String MARKDOWN_HEADING_PREFIX = "#";
+  private static final int MARKDOWN_TITLE_MAX_LEN = 20;
+  private static final int HTTP_STATUS_OK_MIN = 200;
+  private static final int HTTP_STATUS_OK_MAX_EXCLUSIVE = 300;
+  private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(20);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
+  private static final String[] BUSINESS_CODE_FIELDS = {"errcode", "StatusCode", "code"};
+  private static final String[] BUSINESS_MESSAGE_FIELDS = {"errmsg", "msg", "message"};
+
+  private final HttpClient httpClient;
+  private final OutboundGuard guard;
+
+  /** 群聊 @ 目标的记忆条数上限。 */
+  static final int MAX_TRACKED_QUESTIONS = 200;
+
+  private final int chunkSize;
+  private final Map<String, String> sessionWebhooks = new ConcurrentHashMap<>();
+
+  /**
+   * 群聊 @ 目标：按【入站消息 id】记，回复时按 {@code replyToMessageId} 查。
+   *
+   * <p>早期版本按 conversationId 记，于是同一个群里后一个提问者会覆盖前一个 —— A 的回答会 @ 到 后来的 B。群聊每条消息各有各的提问者，键必须落到消息上。
+   *
+   * <p>有界：只保留最近 {@code MAX_TRACKED_QUESTIONS} 条，避免长期运行时按消息无界增长 （同族的 ReplySessionStore 也都有淘汰）。
+   */
+  private final Map<String, String> groupAtUserIds =
+      Collections.synchronizedMap(new BoundedAtTargets());
+
+  public DingTalkMessageSender(OutboundGuard guard, int chunkSize) {
+    this(HttpClient.newBuilder().connectTimeout(REQUEST_TIMEOUT).build(), guard, chunkSize);
+  }
+
+  DingTalkMessageSender(HttpClient httpClient, OutboundGuard guard, int chunkSize) {
+    this.httpClient = httpClient;
+    this.guard = guard;
+    this.chunkSize = chunkSize <= 0 ? DEFAULT_CHUNK_SIZE : chunkSize;
+  }
+
+  /**
+   * 记录会话 webhook 与群聊 @ 目标（senderStaffId 优先）。
+   *
+   * @param messageId 触发本轮编排的那条入站消息 id；回复会带着它作为 {@code replyToMessageId} 回来，@ 目标就按它取
+   */
+  public void rememberSession(
+      String conversationId, String sessionWebhook, String atUserId, String messageId) {
+    if (conversationId != null && !conversationId.isBlank()) {
+      if (sessionWebhook != null && !sessionWebhook.isBlank()) {
+        sessionWebhooks.put(conversationId, sessionWebhook);
+      }
+      if (atUserId != null && !atUserId.isBlank() && messageId != null && !messageId.isBlank()) {
+        groupAtUserIds.put(messageId, atUserId);
+      }
+    }
+  }
+
+  public void send(String conversationId, String text, String replyToMessageId) {
+    String webhook = sessionWebhooks.get(conversationId);
+    if (webhook == null || webhook.isBlank()) {
+      throw new IllegalStateException("钉钉会话 " + conversationId + " 无 sessionWebhook，无法回复");
+    }
+    guard.check(webhook);
+    String atUserId =
+        replyToMessageId != null && !replyToMessageId.isBlank()
+            ? groupAtUserIds.get(replyToMessageId)
+            : null;
+    for (String chunk : segment(text == null ? "" : text, chunkSize)) {
+      postMarkdown(webhook, chunk, atUserId);
+    }
+  }
+
+  private void postMarkdown(String webhook, String content, String atUserId) {
+    try {
+      ObjectNode body = MAPPER.createObjectNode();
+      body.put("msgtype", MSG_TYPE_MARKDOWN);
+      ObjectNode markdown = body.putObject("markdown");
+      markdown.put("title", markdownTitle(content));
+      markdown.put("text", content);
+      if (atUserId != null && !atUserId.isBlank()) {
+        ObjectNode at = body.putObject("at");
+        ArrayNode ids = MAPPER.createArrayNode();
+        ids.add(atUserId);
+        at.set("atUserIds", ids);
+        at.put("isAtAll", false);
+      }
+      String payload = MAPPER.writeValueAsString(body);
+      HttpRequest request =
+          HttpRequest.newBuilder()
+              .uri(URI.create(webhook))
+              .timeout(REQUEST_TIMEOUT)
+              .header("Content-Type", "application/json")
+              .POST(HttpRequest.BodyPublishers.ofString(payload))
+              .build();
+      HttpResponse<String> response =
+          httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+      if (response.statusCode() < HTTP_STATUS_OK_MIN
+          || response.statusCode() >= HTTP_STATUS_OK_MAX_EXCLUSIVE) {
+        throw new IllegalStateException(
+            "钉钉 sessionWebhook 回复失败 HTTP " + response.statusCode() + ": " + response.body());
+      }
+      rejectBusinessError(response.body(), webhook);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new IllegalStateException("钉钉 sessionWebhook 回复失败: " + e.getMessage(), e);
+    }
+  }
+
+  static List<String> segment(String text, int chunkSize) {
+    return io.oryxos.core.channel.OutboundTextSegments.split(text, chunkSize);
+  }
+
+  /** 钉钉 markdown 必填 title：取首行摘要，过长截断；空内容用默认标题。 */
+  static String markdownTitle(String content) {
+    if (content == null || content.isBlank()) {
+      return DEFAULT_MARKDOWN_TITLE;
+    }
+    String line = content.stripLeading();
+    int newline = line.indexOf('\n');
+    if (newline >= 0) {
+      line = line.substring(0, newline);
+    }
+    line = line.strip();
+    if (line.startsWith(MARKDOWN_HEADING_PREFIX)) {
+      line = line.replaceFirst("^#+\\s*", "");
+    }
+    if (line.length() > MARKDOWN_TITLE_MAX_LEN) {
+      line = line.substring(0, MARKDOWN_TITLE_MAX_LEN);
+    }
+    return line.isBlank() ? DEFAULT_MARKDOWN_TITLE : line;
+  }
+
+  /**
+   * HTTP 2xx 仍可能带业务错误码（对齐 {@code NotifyPoster} / 飞书 SDK 口径，#316）。
+   *
+   * <p>缺字段、非 JSON 或非数字 code 不判失败。
+   */
+  static void rejectBusinessError(String responseBody, String webhook) {
+    if (responseBody == null || responseBody.isBlank()) {
+      return;
+    }
+    final JsonNode root;
+    try {
+      root = MAPPER.readTree(responseBody);
+    } catch (JacksonException ignored) {
+      return;
+    }
+    if (root == null || !root.isObject()) {
+      return;
+    }
+    for (String field : BUSINESS_CODE_FIELDS) {
+      JsonNode codeNode = root.get(field);
+      if (codeNode == null || codeNode.isNull() || !codeNode.isValueNode()) {
+        continue;
+      }
+      Long code = asBusinessCode(codeNode);
+      if (code == null) {
+        continue;
+      }
+      if (code != 0L) {
+        throw new IllegalStateException(
+            "钉钉 sessionWebhook 业务失败 "
+                + field
+                + "="
+                + code
+                + messageSuffix(root)
+                + ": "
+                + sanitizeUrl(webhook));
+      }
+      return;
+    }
+  }
+
+  private static Long asBusinessCode(JsonNode node) {
+    if (node.isNumber()) {
+      return node.longValue();
+    }
+    if (node.isTextual()) {
+      String text = node.asText().strip();
+      if (text.isEmpty()) {
+        return null;
+      }
+      try {
+        return Long.parseLong(text);
+      } catch (NumberFormatException ignored) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private static String messageSuffix(JsonNode root) {
+    for (String field : BUSINESS_MESSAGE_FIELDS) {
+      JsonNode msg = root.get(field);
+      if (msg != null && msg.isTextual() && !msg.asText().isBlank()) {
+        return " (" + msg.asText().strip() + ")";
+      }
+    }
+    return "";
+  }
+
+  /**
+   * 日志安全的外形：只留 scheme/host/path，去掉 userinfo、query 与 fragment。
+   *
+   * <p>这里处理的 {@code sessionWebhook} 形如 {@code https://…/robot/sendBySession?session=<能力令牌>} —— 拿着这条
+   * URL 就能以机器人身份 往该会话发消息。而业务失败（HTTP 200 + errcode≠0，如 310000 关键词拦截、发送过快）是钉钉的 <b>常规</b>拒绝方式，异常文案随后会被
+   * {@code safeReply} / 进度流兜底打进 WARN/ERROR， 于是凭证进了日志。只清 CR/LF 挡不住这个 —— 要去掉 query。
+   */
+  private static String sanitizeUrl(String url) {
+    if (url == null) {
+      return "";
+    }
+    String cleaned = url.replace('\r', '_').replace('\n', '_');
+    int cut = cleaned.length();
+    int query = cleaned.indexOf('?');
+    if (query >= 0 && query < cut) {
+      cut = query;
+    }
+    int fragment = cleaned.indexOf('#');
+    if (fragment >= 0 && fragment < cut) {
+      cut = fragment;
+    }
+    String head = cleaned.substring(0, cut);
+    int at = head.indexOf('@');
+    if (at >= 0) {
+      int schemeEnd = head.indexOf("://");
+      head =
+          schemeEnd >= 0
+              ? head.substring(0, schemeEnd + 3) + head.substring(at + 1)
+              : head.substring(at + 1);
+    }
+    return cut < cleaned.length() ? head + "?…" : head;
+  }
+
+  /** 只保留最近 {@link #MAX_TRACKED_QUESTIONS} 条的 {@code msgId → atUserId} 表。 */
+  private static final class BoundedAtTargets extends LinkedHashMap<String, String> {
+
+    private static final long serialVersionUID = 1L;
+
+    BoundedAtTargets() {
+      super(16, 0.75f, false);
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+      return size() > MAX_TRACKED_QUESTIONS;
+    }
+  }
+}

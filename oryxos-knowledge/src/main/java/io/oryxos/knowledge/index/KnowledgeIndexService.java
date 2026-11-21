@@ -2,6 +2,7 @@ package io.oryxos.knowledge.index;
 
 import io.oryxos.core.embedding.TextEmbedder;
 import io.oryxos.core.fs.RealPathBoundary;
+import io.oryxos.core.knowledge.KnowledgeBaseNames;
 import io.oryxos.core.knowledge.KnowledgeImportException;
 import io.oryxos.core.knowledge.KnowledgeManifest;
 import io.oryxos.core.knowledge.model.DocumentState;
@@ -231,6 +232,7 @@ public class KnowledgeIndexService {
    * KnowledgeBuildInProgressException 409）， 每文档一续（fencing 失败立即中止丢弃本代），完成走条件提交（认领已失则不提交、旧代不动）。
    */
   public synchronized void rebuild(String kbName) {
+    Path kbDir = kbDir(kbName); // 名字与边界先判：越界必须在任何副作用（认领/代次/落库）之前拒绝
     long oldGeneration = activeGeneration(kbName);
     long newGeneration = oldGeneration + 1;
     boolean cluster = coordination != null;
@@ -243,8 +245,8 @@ public class KnowledgeIndexService {
       metricsRecorder.recordLeaseAcquired("index");
     }
     try {
-      for (Path file : listSupportedFiles(kbDir(kbName))) {
-        String relPath = kbDir(kbName).relativize(file).toString();
+      for (Path file : listSupportedFiles(kbDir)) {
+        String relPath = kbDir.relativize(file).toString();
         CapturedDocument captured = captureValidated(file);
         ChunkStore.DocumentRecord record =
             store.saveDocument(
@@ -301,8 +303,21 @@ public class KnowledgeIndexService {
   /**
    * 对账（FR-010）：目录 ⇄ 索引差异收敛——新文件/指纹变化/失败态 → 重新导入（后台段推进）； 文件消失 → 清掉索引行。启动与热加载共用；单个坏文件 WARN
    * 跳过、不拖垮整库（US4 场景 3）。
+   *
+   * <p>热加载路径用这个重载：同 JVM 内 {@code PENDING}/{@code INDEXING} 意味着确实有任务在飞，跳过它 避免与在飞任务重复劳动。
    */
   public synchronized void reconcile(String kbName) {
+    reconcile(kbName, false);
+  }
+
+  /**
+   * 对账，并显式声明这次是不是「进程重启后的首轮」。
+   *
+   * <p>{@code afterRestart} 为真时，{@code PENDING}/{@code INDEXING} 也算差异：那两种状态的隐含前提是 「同 JVM
+   * 里有任务在飞」，而重启后不存在在飞的任务，也没有别的机制把这行拉回终态。不重驱动它就永远停在 「待索引」——文件在盘上、内容可读，却检索不到，且 {@code failureReason}
+   * 是 null，管理员既看不到卡住 也看不到原因（FR-008 的状态机、FR-010 的启动对账）。
+   */
+  public synchronized void reconcile(String kbName, boolean afterRestart) {
     Path kbDir = kbDir(kbName);
     long generation = activeGeneration(kbName);
     Map<String, ChunkStore.DocumentRecord> indexed = new java.util.HashMap<>();
@@ -317,6 +332,9 @@ public class KnowledgeIndexService {
       boolean changed =
           existing == null
               || existing.state() == DocumentState.FAILED
+              || (afterRestart
+                  && (existing.state() == DocumentState.PENDING
+                      || existing.state() == DocumentState.INDEXING))
               || !MessageDigest.isEqual(
                   existing.sha256().getBytes(StandardCharsets.UTF_8),
                   sha256(file).getBytes(StandardCharsets.UTF_8));
@@ -535,7 +553,7 @@ public class KnowledgeIndexService {
   }
 
   private Path kbDir(String kbName) {
-    Path dir = knowledgeRoot.resolve(kbName);
+    Path dir = KnowledgeBaseNames.requireBaseDir(knowledgeRoot, kbName);
     if (!Files.isDirectory(dir)) {
       throw new IllegalArgumentException("知识库不存在: " + kbName);
     }

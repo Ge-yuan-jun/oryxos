@@ -7,6 +7,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -19,6 +20,7 @@ import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
@@ -82,6 +84,7 @@ class ScheduleApiControllerTest {
                     false,
                     "session-1",
                     Instant.parse("2026-08-14T00:00:00Z"),
+                    Instant.parse("2026-08-14T00:00:00Z"),
                     true,
                     null,
                     12)));
@@ -117,6 +120,7 @@ class ScheduleApiControllerTest {
                     false,
                     "session-1",
                     Instant.parse("2026-08-14T00:00:00Z"),
+                    Instant.parse("2026-08-14T00:00:00Z"),
                     true,
                     null,
                     12)));
@@ -142,6 +146,21 @@ class ScheduleApiControllerTest {
     when(taskStore.list()).thenReturn(List.of(ALPHA_DAILY, BETA_DAILY));
 
     mvc.perform(get("/api/v1/schedules"))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value(409));
+  }
+
+  @Test
+  void v1SetEnabledRejectsAmbiguousLegacyKeyInsteadOfReturningDuplicateTaskIds() throws Exception {
+    // The request key resolves to exactly one task, but the response body this endpoint returns is
+    // the whole list — the same shape GET /api/v1/schedules refuses.
+    when(taskStore.findByKey("daily")).thenReturn(List.of(ALPHA_DAILY));
+    when(taskStore.list()).thenReturn(List.of(ALPHA_DAILY, BETA_DAILY));
+
+    mvc.perform(
+            put("/api/v1/schedules/daily")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"enabled\":false}"))
         .andExpect(status().isConflict())
         .andExpect(jsonPath("$.code").value(409));
   }
